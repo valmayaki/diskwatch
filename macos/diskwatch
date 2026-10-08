@@ -200,6 +200,7 @@ bar() { # pct width
 }
 
 # Progress of a running scan. --watch refreshes every 2s.
+# shellcheck disable=SC2120  # cmd_progress: recursive --watch call takes no args
 cmd_progress() {
   if [[ ${1:-} == --watch ]]; then
     while :; do clear; cmd_progress; sleep 2; done

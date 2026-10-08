@@ -92,6 +92,7 @@ cmd_scan() {
   check_alerts
 }
 
+# shellcheck disable=SC2120  # cmd_progress: recursive --watch call takes no args
 cmd_progress() {
   if [[ ${1:-} == --watch ]]; then while :; do clear; cmd_progress; sleep 2; done; fi
   if ! pgrep -f 'duc index.*diskwatch' >/dev/null; then

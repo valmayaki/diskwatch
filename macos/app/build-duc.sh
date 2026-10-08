@@ -2,7 +2,8 @@
 # Build a standalone, universal (arm64 + x86_64) duc for Diskwatch.app, runnable on
 # macOS 12 Monterey and later: vim keys (duc_vim_patch.py), indexing + ncurses UI,
 # Tokyo Cabinet built from source and linked statically; otherwise only macOS system
-# libraries (/usr/lib). Build-time needs: Xcode command line tools, curl, python3.
+# libraries (/usr/lib). Build-time needs: Xcode command line tools, curl, python3
+# (no Homebrew: Tokyo Cabinet is passed via TC_CFLAGS/TC_LIBS, pkg-config is not used).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 export MACOSX_DEPLOYMENT_TARGET=12.0
@@ -44,7 +45,8 @@ for arch in "${archs[@]}"; do
   (cd "$work/duc-$arch" && ./configure -q --host="$host" --with-db-backend=tokyocabinet \
      --disable-cairo --disable-x11 --disable-opengl \
      CC="$cc" CPPFLAGS="-I$pfx/include" LDFLAGS="-L$pfx/lib" LIBS="-lz -lbz2 -lm" \
-     PKG_CONFIG_PATH=/nonexistent >/dev/null \
+     TC_CFLAGS="-I$pfx/include" TC_LIBS="-L$pfx/lib -ltokyocabinet -lz -lbz2 -lm" \
+     PKG_CONFIG=/usr/bin/false >/dev/null \
    && make -s -j"$(sysctl -n hw.ncpu)" 2>&1 | grep -iE '\berror\b' || true)
   cp "$work/duc-$arch/duc" "$work/duc.$arch"
 done
