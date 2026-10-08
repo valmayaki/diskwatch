@@ -44,4 +44,4 @@ jobs:
             minos=$(otool -arch "$arch" -l macos/app/build/duc | awk '/minos/{v=$2} END{print v}')
             echo "$arch minos=$minos"; [ "$minos" = 12.0 ]
           done
-          ! otool -L macos/app/build/duc | grep -v '^/' | grep -vE '^\s+/usr/lib/' | grep -q .   # system libraries only
+          ! otool -L macos/app/build/duc | grep -E '^[[:space:]]' | grep -vqE '^[[:space:]]+/usr/lib/'   # system libraries only
