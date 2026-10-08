@@ -1,0 +1,9 @@
+# {{ ansible_managed }}
+[Unit]
+Description=diskwatch: nightly disk index
+[Timer]
+OnCalendar=*-*-* {{ diskwatch_scan_hour }}:00:00
+RandomizedDelaySec=15m
+Persistent=true
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Bundled agent for macOS 13+ (SMAppService). One fixed job: `diskwatch tick` every
+     5 minutes; the user's schedule is read from ~/.local/share/diskwatch/schedule.conf. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.diskwatch.agent</string>
+  <key>BundleProgram</key><string>Contents/MacOS/diskwatch-launcher</string>
+  <key>ProgramArguments</key><array><string>diskwatch-launcher</string><string>tick</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>19</integer>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+</dict></plist>

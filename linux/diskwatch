@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+# diskwatch (Linux) — cached whole-disk usage index, growth reports, storage/cleanup/package
+# reports for Debian and Proxmox hosts. Scans run as root from a systemd timer; every
+# report command reads the index, so they are instant and work for any user.
+#
+# Usage: diskwatch <command> [args]   (diskwatch help)
+
+set -euo pipefail
+
+DATA_DIR="${DISKWATCH_DATA:-/var/lib/diskwatch}"
+DB="$DATA_DIR/duc.db"
+SNAP_DIR="$DATA_DIR/snapshots"
+PROGRESS="$DATA_DIR/progress.log"
+LAST_TOTAL="$DATA_DIR/last_total"
+FREE_LOG="$DATA_DIR/free.tsv"
+PKG_SEEN="$DATA_DIR/pkg-seen.tsv"     # package \t samples \t first_seen \t last_seen
+EXE_MAP="$DATA_DIR/exe-pkg.tsv"       # executable path \t package (dpkg -S cache)
+LOG_TAG=diskwatch
+SNAP_LEVELS="${DISKWATCH_LEVELS:-4}"
+MIN_DELTA_MB="${DISKWATCH_MIN_DELTA_MB:-200}"
+FREE_ALERT_PCT="${DISKWATCH_FREE_ALERT_PCT:-10}"
+GROWTH_ALERT_GB="${DISKWATCH_GROWTH_ALERT_GB:-5}"
+INSTALL_BIN=/usr/local/bin/diskwatch
+# Filesystems that hold local data. Network (nfs, cifs, fuse.*), pseudo (proc, sysfs,
+# tmpfs, overlay) and image (squashfs: snaps) filesystems are never scanned.
+LOCAL_FS="ext4,ext3,ext2,xfs,btrfs,zfs,f2fs,vfat,exfat,jfs,reiserfs,bcachefs"
+
+log()  { logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; }
+die()  { echo "diskwatch: $*" >&2; exit 1; }
+human() { awk -v b="$1" 'BEGIN{s="BKMGTP";a=b<0?-b:b;i=1;while(a>=1024&&i<6){a/=1024;i++}printf "%s%.1f%s",(b<0?"-":""),a,substr(s,i,1)}'; }
+take() { awk -v n="$1" 'NR<=n'; }   # head -n that drains input (no SIGPIPE under pipefail)
+need_duc() { command -v duc >/dev/null || die "duc not installed: apt install duc"; }
+need_root() { [[ $EUID -eq 0 ]] || die "$1 needs root (sudo diskwatch $1)"; }
+need_db() {
+  need_duc
+  [[ -s $DB ]] && return 0
+  compgen -G "$DB.tmp.*" >/dev/null && die "first scan still running; see: diskwatch progress"
+  die "no index yet — run: sudo diskwatch scan"
+}
+mtime() { stat -c %Y "$1"; }
+fmt_time() { date -d "@$1" '+%F %H:%M'; }
+
+# Scan roots: every mounted local filesystem, skipping bind mounts (a subtree of a
+# filesystem mounted elsewhere, e.g. host storage bound into a container: counting it
+# here double-counts the host) and duplicate mounts of the same source.
+# Override with DISKWATCH_PATHS="/:/srv".
+scan_roots() {
+  if [[ -n ${DISKWATCH_PATHS:-} ]]; then tr ':' '\n' <<<"$DISKWATCH_PATHS"; return; fi
+  findmnt -rn -o TARGET,SOURCE -t "$LOCAL_FS" | awk '
+    { t=$1; s=$2; gsub(/\\x20/, " ", t) }
+    s ~ /\[.+\]$/ { next }            # bind mount of a subdirectory
+    seen[s]++     { next }            # same filesystem mounted twice
+    { print t }'
+}
+bind_mounts() {
+  findmnt -rn -o TARGET,SOURCE -t "$LOCAL_FS" | awk '$2 ~ /\[.+\]$/ {print $1"  ("$2")"}'
+}
+
+# ---------------------------------------------------------------- scan
+
+cmd_scan() {
+  need_root scan; need_duc
+  mkdir -p "$DATA_DIR" "$SNAP_DIR"; chmod 755 "$DATA_DIR" "$SNAP_DIR"
+  local roots=() r tmp start snap ex=()
+  while IFS= read -r r; do [[ -d $r ]] && roots+=("$r"); done < <(scan_roots)
+  (( ${#roots[@]} )) || die "no local filesystems found"
+  if [[ -n ${DISKWATCH_EXCLUDE:-} ]]; then
+    local e; IFS=: read -ra _ex <<<"$DISKWATCH_EXCLUDE"; for e in "${_ex[@]}"; do ex+=(-e "$e"); done
+  fi
+  tmp="$DB.tmp.$$"; start=$(date +%s)
+  log "scan start: ${roots[*]}"
+  # Separate -x per root: duc stays on each root's filesystem; mounts inside a root are
+  # roots of their own. `script` gives duc a tty so it prints -p progress for `progress`.
+  local cmd; printf -v cmd '%q ' ionice -c3 nice -n19 duc index -q -p -H -x "${ex[@]}" -d "$tmp" "${roots[@]}"
+  script -q -f -e -c "$cmd" "$PROGRESS" >/dev/null || log "duc index exited non-zero (permission errors are normal)"
+  [[ -s $tmp ]] || { rm -f "$tmp"; die "index failed"; }
+  chmod 644 "$tmp"; mv -f "$tmp" "$DB"
+
+  snap="$SNAP_DIR/$(date +%Y-%m-%dT%H%M).tsv"
+  for r in "${roots[@]}"; do
+    duc ls -q -d "$DB" -D -b "$r" | awk -v d="$r" '{print $1"\t"d}'
+    duc ls -q -d "$DB" -b -R --full-path --dirs-only -l "$SNAP_LEVELS" "$r" |
+      awk -v d="$r" '{s=$1; sub(/^[ \t]*[0-9]+[ \t]+/,""); print s"\t"(d=="/" ? "" : d)"/"$0}'
+  done >"$snap"
+  chmod 644 "$snap"
+  for r in "${roots[@]}"; do awk -F'\t' -v p="$r" '$2==p{print $1}' "$snap"; done |
+    awk '{t+=$1} END{print t+0}' >"$LAST_TOTAL"
+  rm -f "$PROGRESS"
+  printf '%s\t%s\n' "$(date +%s)" "$(df -B1 --output=avail / | tail -1 | tr -d ' ')" >>"$FREE_LOG"
+  ls -1t "$SNAP_DIR"/*.tsv | tail -n +91 | xargs -r rm -f
+  log "scan done in $(( $(date +%s) - start ))s -> $(basename "$snap")"
+  check_alerts
+}
+
+cmd_progress() {
+  if [[ ${1:-} == --watch ]]; then while :; do clear; cmd_progress; sleep 2; done; fi
+  if ! pgrep -f 'duc index.*diskwatch' >/dev/null; then
+    echo "diskwatch scan: not running (last: $(latest_snaps 1 | xargs -r -n1 basename || echo never))"; return 0
+  fi
+  local line done_b files total est="" start pct
+  line=$(tail -c 4096 "$PROGRESS" 2>/dev/null | tr '\r' '\n' |
+         grep -E 'Indexed [0-9.]+[KMGTP]?b in [0-9.]+[KMG]? files' | tail -1 || true)
+  done_b=$(sed -nE 's/.*Indexed ([0-9.]+)([KMGTP]?)b.*/\1 \2/p' <<<"$line" |
+    awk '{m=index("KMGTP",$2); v=$1; while(m-->0) v*=1024; printf "%d", v}')
+  files=$(sed -nE 's/.*in ([0-9.]+[KMG]?) files.*/\1/p' <<<"$line")
+  if [[ -s $LAST_TOTAL ]]; then total=$(<"$LAST_TOTAL")
+  else
+    total=$(scan_roots | while IFS= read -r r; do df -B1 --output=used "$r" | tail -1; done | awk '{t+=$1} END{print t+0}')
+    est="≈"
+  fi
+  start=$(stat -c %W "$PROGRESS" 2>/dev/null); [[ ${start:-0} -gt 0 ]] || start=$(mtime "$PROGRESS")
+  pct=$(awk -v a="${done_b:-0}" -v b="$total" 'BEGIN{p=(b>0 ? a*100/b : 0); print (p>99.9 ? 99.9 : p)}')
+  printf 'Disk scan  %s  %s / %s%s  %s files  %dm%02ds\n' "$(bar "$pct")" "$(human "${done_b:-0}")" \
+    "$est" "$(human "$total")" "${files:-0}" $(( ($(date +%s) - start) / 60 )) $(( ($(date +%s) - start) % 60 ))
+}
+bar() { awk -v p="$1" -v w=40 'BEGIN{n=int(p*w/100); s=""; for(i=0;i<w;i++) s=s (i<n?"█":"░"); printf "%s %5.1f%%", s, p}'; }
+
+# ---------------------------------------------------------------- reports
+
+latest_snaps() { { ls -1t "$SNAP_DIR"/*.tsv 2>/dev/null || true; } | take "${1:-2}"; }
+diff_snaps() {
+  awk -F'\t' -v min=$(( MIN_DELTA_MB * 1024 * 1024 )) '
+    FNR==NR {old[$2]=$1; next}
+    { d=$1-old[$2]; if (d>=min || d<=-min) printf "%d\t%d\t%s\n", d, $1, $2 }
+  ' "$1" "$2" | sort -t$'\t' -k1,1nr
+}
+
+cmd_report() {
+  local n=${1:-20} snaps new old
+  snaps=$(latest_snaps 2); new=$(sed -n 1p <<<"$snaps"); old=$(sed -n 2p <<<"$snaps")
+  [[ -n $new ]] || die "no snapshots yet — run: sudo diskwatch scan"
+  if [[ -z $old ]]; then
+    echo "Only one snapshot ($(basename "$new" .tsv)); largest folders:"
+    sort -t$'\t' -k1,1nr "$new" | take "$n" | while IFS=$'\t' read -r s p; do printf '  %8s  %s\n' "$(human "$s")" "$p"; done
+    return
+  fi
+  echo "Changes since $(basename "$old" .tsv) → $(basename "$new" .tsv) (≥ ${MIN_DELTA_MB}MB):"
+  diff_snaps "$old" "$new" | take "$n" |
+    while IFS=$'\t' read -r d s p; do printf '  %9s  now %8s  %s\n' "$( (( d > 0 )) && echo +)$(human "$d")" "$(human "$s")" "$p"; done
+}
+
+cmd_history() {
+  local f s t a
+  if [[ $# -eq 0 ]]; then
+    [[ -s $FREE_LOG ]] || die "no scans yet"
+    while IFS=$'\t' read -r t a; do printf '%s  / free %s\n' "$(fmt_time "$t")" "$(human "$a")"; done <"$FREE_LOG"; return
+  fi
+  for f in "$SNAP_DIR"/*.tsv; do
+    [[ -e $f ]] || continue
+    s=$(awk -F'\t' -v p="${1%/}" '$2==p{print $1; exit}' "$f")
+    printf '%s  %s\n' "$(basename "$f" .tsv)" "$( [[ -n $s ]] && human "$s" || echo -)"
+  done
+}
+
+# Indexed path for a typed path: the deepest scan root that contains it (index paths are real paths).
+db_path() { local p; p=$(cd "$1" 2>/dev/null && pwd -P || echo "$1"); echo "$p"; }
+cmd_roots() { need_db; echo "Indexed roots:"; duc info -q -d "$DB" | awk 'NR>1{print "  "$NF"  ("$(NF-1)")"}'
+  local b; b=$(bind_mounts); [[ -z $b ]] || { echo "Bind mounts (not scanned; counted where they live):"; sed 's/^/  /' <<<"$b"; }; }
+cmd_ls() {
+  need_db
+  local ap=() p; [[ ${1:-} == -a ]] && { ap=(-a); shift; }
+  p=$(db_path "${1:-/}")
+  echo "$p  (index of $(fmt_time "$(mtime "$DB")"))"
+  duc ls -q "${ap[@]}" -b -d "$DB" "$p" | take "${2:-20}" | while read -r s name; do printf '  %9s  %s\n' "$(human "$s")" "$name"; done
+}
+cmd_du() {
+  need_db
+  local p s
+  for p in "$@"; do
+    s=$(duc ls -q -D -b -d "$DB" "$(db_path "$p")" 2>/dev/null | awk '{print $1; exit}' || true)
+    printf '%9s  %s\n' "$( [[ -n $s ]] && human "$s" || echo -)" "$p"
+  done
+}
+cmd_ui() {
+  need_db
+  local ui=duc; command -v duc-ui >/dev/null && ui=duc-ui
+  [[ $# -eq 0 ]] && cmd_roots >&2
+  [[ $ui == duc-ui ]] && echo "keys: j/k move · h/l up/into · g/G top/bottom · ? help · q quit" >&2
+  exec "$ui" ui -d "$DB" "$(db_path "${1:-/}")"
+}
+
+# ---------------------------------------------------------------- storage (block level)
+
+# What the file index cannot see: VM disks on LVM-thin/ZFS zvols/Ceph, ZFS snapshots,
+# thin-pool fill. Proxmox: per-storage and per-guest volume usage.
+cmd_storage() {
+  echo "== Filesystems"
+  df -hT -x tmpfs -x devtmpfs -x overlay -x squashfs -x efivarfs 2>/dev/null
+  if command -v pvesm >/dev/null; then
+    echo; echo "== Proxmox storages (pvesm status)"
+    pvesm status 2>/dev/null | awk 'NR==1 || $3=="active"' | column -t
+    echo; echo "== Largest guest volumes"
+    local st
+    for st in $(pvesm status 2>/dev/null | awk 'NR>1 && $3=="active"{print $1}'); do
+      pvesm list "$st" 2>/dev/null | awk -v st="$st" 'NR>1{printf "%s\t%s\t%s\n", $4, st, $1}'
+    done | sort -t$'\t' -k1,1nr | take 15 | while IFS=$'\t' read -r sz st vol; do
+      printf '  %9s  %-12s %s\n' "$(human "$sz")" "$st" "$vol"
+    done
+    echo "  (provisioned size; thin volumes may use less — see LVM data% below)"
+  fi
+  if command -v lvs >/dev/null && [[ $EUID -eq 0 ]] && lvs --noheadings 2>/dev/null | grep -q .; then
+    echo; echo "== LVM (data%/meta% = fill of thin pools and thin volumes)"
+    vgs --units g 2>/dev/null
+    lvs --units g -o lv_name,vg_name,lv_size,pool_lv,data_percent,metadata_percent --sort -lv_size 2>/dev/null | take 20
+  fi
+  if command -v zfs >/dev/null && zpool list -H 2>/dev/null | grep -q .; then
+    echo; echo "== ZFS"
+    zpool list -o name,size,alloc,free,frag,cap,health 2>/dev/null
+    zfs list -o name,used,avail,usedbysnapshots,refer,mountpoint -s used 2>/dev/null | tail -n 15
+  fi
+}
+
+# ---------------------------------------------------------------- cleanup hints
+
+cmd_cleanup() {
+  local s
+  section() { printf '\n== %s\n' "$1"; }
+  section "journald logs"
+  journalctl --disk-usage 2>/dev/null | sed 's/^/  /'
+  echo "  reclaim: sudo journalctl --vacuum-size=500M"
+  section "APT package cache"
+  s=$(du -sb /var/cache/apt/archives 2>/dev/null | cut -f1); echo "  $(human "${s:-0}")  /var/cache/apt/archives   reclaim: sudo apt clean"
+  local auto; auto=$(apt-get -s autoremove 2>/dev/null | grep -c '^Remv' || true)
+  echo "  ${auto} packages autoremovable                      reclaim: sudo apt autoremove --purge"
+  section "Kernels"
+  local running; running=$(uname -r)
+  dpkg-query -Wf '${Status}\t${Package}\t${Installed-Size}\n' 'linux-image-*' 'proxmox-kernel-*' 'pve-kernel-*' 2>/dev/null |
+    awk -F'\t' -v r="$running" '$1 ~ /installed/ && $2 ~ /[0-9]/ && $3 > 1024 {m=(index($2, r) ? "  ← running" : ""); n++; t+=$3; printf "  %8.1fM  %s%s\n", $3/1024, $2, m}
+      END {if (n > 1) printf "  %d kernels, %.1fG; keep the running one and one fallback\n", n, t/1048576}'
+  command -v proxmox-boot-tool >/dev/null && echo "  Proxmox: old kernels go with apt autoremove; proxmox-boot-tool kernel list"
+  section "Logs and crash dumps"
+  for p in /var/log /var/lib/systemd/coredump /var/crash /tmp /var/tmp; do
+    [[ -d $p ]] && printf '  %8s  %s\n' "$(human "$(du -sxb "$p" 2>/dev/null | cut -f1)")" "$p"
+  done
+  find /var/log -xdev -type f -size +100M -printf '  %s\t%p\n' 2>/dev/null | sort -rn | take 5 |
+    while IFS=$'\t' read -r sz p; do printf '  %8s  %s (large log)\n' "$(human "${sz// /}")" "$p"; done
+  if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+    section "Docker"
+    docker system df 2>/dev/null | sed 's/^/  /'
+    echo "  reclaim: docker image prune -a (unused images) · docker builder prune · docker volume prune (careful)"
+    find /var/lib/docker/containers -name '*-json.log' -size +100M -printf '  %s\t%p\n' 2>/dev/null | sort -rn | take 5 |
+      while IFS=$'\t' read -r sz p; do printf '  %8s  %s (container log; cap with log-opts max-size)\n' "$(human "${sz// /}")" "$p"; done
+  fi
+  if command -v snap >/dev/null; then
+    section "Snap"
+    local dis; dis=$(snap list --all 2>/dev/null | awk '/disabled/{c++} END{print c+0}')
+    echo "  $dis disabled snap revisions   reclaim: snap remove <name> --revision=<rev>; snap set system refresh.retain=2"
+  fi
+  if command -v flatpak >/dev/null; then
+    section "Flatpak"; echo "  reclaim unused runtimes: flatpak uninstall --unused"
+  fi
+  if command -v pvesm >/dev/null; then
+    section "Proxmox"
+    for p in /var/lib/vz/dump /var/lib/vz/template/iso /var/lib/vz/template/cache; do
+      [[ -d $p ]] && printf '  %8s  %s\n' "$(human "$(du -sxb "$p" 2>/dev/null | cut -f1)")" "$p"
+    done
+    ls -1t /var/lib/vz/dump/*.{zst,lzo,gz,vma} 2>/dev/null | tail -n +4 | take 5 | sed 's/^/  older backup: /'
+    command -v zfs >/dev/null && zfs list -H -t snapshot -o used,name -s used 2>/dev/null | tail -n 5 | sed 's/^/  zfs snapshot: /'
+  fi
+  echo; echo "Nothing was changed. Review before running any reclaim command."
+}
+
+# ---------------------------------------------------------------- packages
+
+# Record which packages own the executables running now (cheap; every 15 min).
+cmd_sample() {
+  need_root sample
+  mkdir -p "$DATA_DIR"; touch "$PKG_SEEN" "$EXE_MAP"
+  local now exe pkgs; now=$(date +%s)
+  # New executables → package via dpkg -S, cached forever.
+  for exe in $(ps -eo exe= 2>/dev/null | sort -u | grep '^/' || true); do
+    grep -qF "$exe"$'\t' "$EXE_MAP" && continue
+    printf '%s\t%s\n' "$exe" "$(dpkg -S "$exe" 2>/dev/null | head -1 | cut -d: -f1 || true)" >>"$EXE_MAP"
+  done
+  pkgs=$(ps -eo exe= 2>/dev/null | sort -u | awk -F'\t' 'NR==FNR{m[$1]=$2; next} ($1 in m) && m[$1]!="" {print m[$1]}' "$EXE_MAP" - | sort -u)
+  awk -F'\t' -v now="$now" -v OFS='\t' '
+    FNR==NR {seen[$1]=1; next}
+    { if ($1 in seen) { $2++; $4=now; delete seen[$1] } print }
+    END { for (p in seen) print p, 1, now, now }' <(printf '%s\n' "$pkgs" | grep .) "$PKG_SEEN" >"$PKG_SEEN.tmp"
+  mv -f "$PKG_SEEN.tmp" "$PKG_SEEN"; chmod 644 "$PKG_SEEN" "$EXE_MAP"
+}
+
+# Largest packages with a last-used estimate: newest atime among the package's
+# executables (relatime keeps it within a day) and diskwatch's own run-time samples.
+cmd_pkgs() {
+  local n=${1:-25} now; now=$(date +%s)
+  local atime_ok=yes; grep -E ' / ' /proc/mounts | grep -q noatime && atime_ok=no
+  printf '%9s  %-10s  %-8s  %s\n' SIZE "LAST USED" SOURCE PACKAGE
+  dpkg-query -Wf '${Installed-Size}\t${Package}\n' 2>/dev/null | sort -rn | take "$n" |
+  while IFS=$'\t' read -r kb pkg; do
+    local last=0 src="-" t
+    if [[ $atime_ok == yes ]]; then
+      t=$(dpkg -L "$pkg" 2>/dev/null | grep -E '/(s?bin|libexec)/' | xargs -r stat -c %X 2>/dev/null | sort -n | tail -1 || true)
+      [[ -n $t ]] && { last=$t; src=atime; }
+    fi
+    t=$(awk -F'\t' -v p="$pkg" '$1==p{print $4}' "$PKG_SEEN" 2>/dev/null || true)
+    [[ -n $t && $t -gt $last ]] && { last=$t; src=running; }
+    printf '%9s  %-10s  %-8s  %s\n' "$(human $((kb * 1024)))" \
+      "$( ((last > 0)) && echo "$(( (now - last) / 86400 ))d ago" || echo 'no exe')" "$src" "$pkg"
+  done
+  if command -v snap >/dev/null; then echo; echo "Snaps:"; snap list 2>/dev/null | tail -n +2 | awk '{print "  "$1"  rev "$3}' | take 15; fi
+  if command -v flatpak >/dev/null; then echo; echo "Flatpaks:"; flatpak list --columns=size,application 2>/dev/null | take 15 | sed 's/^/  /'; fi
+  echo
+  echo "LAST USED: newest access time of the package's executables${atime_ok/no/ (unreliable: noatime)},"
+  echo "or when diskwatch last saw one running. 'no exe' = libraries/data only (used via other packages)."
+}
+
+# ---------------------------------------------------------------- alerts / status
+
+check_alerts() {
+  local r used size pct snaps msg
+  while IFS= read -r r; do
+    read -r size used < <(df -B1 --output=size,used "$r" | tail -1)
+    pct=$(( (size - used) * 100 / (size > 0 ? size : 1) ))
+    (( pct < FREE_ALERT_PCT )) && notify "$r has only ${pct}% free ($(human $((size - used))))"
+  done < <(scan_roots)
+  snaps=$(latest_snaps 2); [[ $(wc -l <<<"$snaps") -eq 2 ]] || return 0
+  msg=$(diff_snaps "$(sed -n 2p <<<"$snaps")" "$(sed -n 1p <<<"$snaps")" |
+        awk -F'\t' -v t=$(( GROWTH_ALERT_GB * 1024 * 1024 * 1024 )) '$1>=t && !f{print $3; f=1}')
+  [[ -z $msg ]] || notify "$msg grew ≥ ${GROWTH_ALERT_GB}GB since the last scan"
+  return 0
+}
+# Alerts go to the journal (journalctl -t diskwatch); DISKWATCH_NOTIFY_CMD (in
+# /etc/default/diskwatch) also receives them, e.g. "curl -d @- ntfy.sh/mytopic".
+notify() {
+  log "ALERT $(hostname): $1"
+  [[ -f /etc/default/diskwatch ]] && . /etc/default/diskwatch
+  [[ -n ${DISKWATCH_NOTIFY_CMD:-} ]] && printf 'diskwatch %s: %s\n' "$(hostname)" "$1" | sh -c "$DISKWATCH_NOTIFY_CMD" || true
+}
+
+cmd_status() {
+  echo "Data:      $DATA_DIR ($(du -sh "$DATA_DIR" 2>/dev/null | cut -f1))"
+  echo "Index:     $( [[ -s $DB ]] && fmt_time "$(mtime "$DB")" || echo none)"
+  echo "Snapshots: $(ls "$SNAP_DIR"/*.tsv 2>/dev/null | wc -l)"
+  echo "Roots:     $(scan_roots | tr '\n' ' ')"
+  systemctl list-timers 'diskwatch-*' --no-pager 2>/dev/null | sed -n '1,4p'
+  echo "Last log:"; journalctl -t "$LOG_TAG" -n 3 --no-pager -o short 2>/dev/null | sed 's/^/  /'
+}
+
+# ---------------------------------------------------------------- install
+
+cmd_install() {
+  need_root install
+  local hour=${1:-3}
+  command -v duc >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q duc >/dev/null
+  [[ $(readlink -f "$0") == "$INSTALL_BIN" ]] || install -m 755 "$0" "$INSTALL_BIN"
+  mkdir -p "$DATA_DIR" "$SNAP_DIR"; chmod 755 "$DATA_DIR" "$SNAP_DIR"
+  cat >/etc/systemd/system/diskwatch-scan.service <<EOF
+[Unit]
+Description=diskwatch: index disk usage
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_BIN scan
+Nice=19
+IOSchedulingClass=idle
+EOF
+  cat >/etc/systemd/system/diskwatch-scan.timer <<EOF
+[Unit]
+Description=diskwatch: nightly disk index
+[Timer]
+OnCalendar=*-*-* ${hour}:00:00
+RandomizedDelaySec=15m
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  cat >/etc/systemd/system/diskwatch-sample.service <<EOF
+[Unit]
+Description=diskwatch: sample running packages
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_BIN sample
+Nice=19
+EOF
+  cat >/etc/systemd/system/diskwatch-sample.timer <<EOF
+[Unit]
+Description=diskwatch: sample running packages every 15 min
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=15m
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now diskwatch-scan.timer diskwatch-sample.timer >/dev/null
+  echo "Installed $INSTALL_BIN; timers: nightly scan ${hour}:00 (catches up after downtime), package sampling every 15 min."
+  echo "First index: sudo diskwatch scan   (or: sudo systemctl start diskwatch-scan)"
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  systemctl disable --now diskwatch-scan.timer diskwatch-sample.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/diskwatch-{scan,sample}.{service,timer} "$INSTALL_BIN"
+  systemctl daemon-reload
+  echo "Removed timers and $INSTALL_BIN. Data kept in $DATA_DIR (rm -rf it to delete)."
+}
+
+usage() {
+  cat <<EOF
+diskwatch (Linux) — what is using disk space, and what changed.
+
+  scan              index all local filesystems (root; background I/O priority)
+  progress [--watch] progress bar of a running scan
+  report [N]        what grew/shrank since the previous scan
+  history [PATH]    PATH's size in every snapshot (no PATH: free space per scan)
+  ls [-a] [PATH] [N] largest children of PATH from the index
+  du PATH...        size of PATHs from the index
+  roots             indexed roots, and bind mounts left out
+  ui [PATH]         browse the index (vim keys with duc-ui)
+  storage           block level: LVM thin pools, ZFS, Proxmox storages and guest disks
+  cleanup           reclaimable space: journal, apt, kernels, logs, docker, snap, backups
+  pkgs [N]          largest packages with last-used estimate
+  sample            record running packages (timer, every 15 min)
+  install [HOUR] / uninstall   systemd timers (root)
+  status            index age, timers, recent log
+
+Env: DISKWATCH_PATHS="/:/srv" roots, DISKWATCH_EXCLUDE="name:name", DISKWATCH_MIN_DELTA_MB,
+DISKWATCH_FREE_ALERT_PCT, DISKWATCH_GROWTH_ALERT_GB; alerts: journalctl -t diskwatch.
+EOF
+}
+
+case "${1:-help}" in
+  scan|progress|report|history|ls|du|roots|ui|storage|cleanup|pkgs|sample|install|uninstall|status)
+    c=$1; shift; "cmd_$c" "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

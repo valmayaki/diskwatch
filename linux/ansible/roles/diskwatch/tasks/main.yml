@@ -1,0 +1,26 @@
+---
+- name: Validate diskwatch settings
+  ansible.builtin.assert:
+    that:
+      - diskwatch_state in ['present', 'absent']
+      - diskwatch_scan_hour | int >= 0 and diskwatch_scan_hour | int <= 23
+      - diskwatch_free_alert_pct | int >= 0 and diskwatch_free_alert_pct | int <= 100
+    fail_msg: "Invalid diskwatch settings (state={{ diskwatch_state }}, scan_hour={{ diskwatch_scan_hour }})"
+  tags: [diskwatch, diskwatch_install, diskwatch_remove]
+
+- name: Install diskwatch
+  ansible.builtin.include_tasks:
+    file: install.yml
+    apply:
+      tags: [diskwatch, diskwatch_install]
+  when: diskwatch_state == 'present'
+  tags: [diskwatch, diskwatch_install, diskwatch_packages, diskwatch_script, diskwatch_ui,
+         diskwatch_config, diskwatch_systemd, diskwatch_scan]
+
+- name: Remove diskwatch
+  ansible.builtin.include_tasks:
+    file: remove.yml
+    apply:
+      tags: [diskwatch, diskwatch_remove]
+  when: diskwatch_state == 'absent'
+  tags: [diskwatch, diskwatch_remove]

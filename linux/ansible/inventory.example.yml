@@ -1,0 +1,14 @@
+---
+# Example inventory — copy to inventory.yml. Host names are DNS names or ~/.ssh/config aliases.
+all:
+  children:
+    diskwatch_hosts:
+      hosts:
+        proxmox-a:
+          ansible_user: root
+        server-b:
+          ansible_user: admin        # any sudo-capable user; the play uses become
+      vars:
+        ansible_python_interpreter: /usr/bin/python3
+        # diskwatch_scan_hour: 3
+        # diskwatch_notify_cmd: "curl -s -d @- https://ntfy.sh/<topic>"

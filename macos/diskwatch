@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+# diskwatch — low-memory disk usage tracker + app usage tracker for macOS.
+#
+# Disk: indexes with `duc` (on-disk database, tiny RAM footprint) at background
+#       priority, keeps dated folder-size snapshots, and reports what grew.
+# Apps: combines Spotlight's last-used date / launch count with its own
+#       15-minute samples of running apps, to find apps you can uninstall.
+#
+# Usage: diskwatch <command> [args]   (run `diskwatch help` for the list)
+
+set -euo pipefail
+# Runs under macOS /bin/bash 3.2 inside Diskwatch.app: no bash-4 features; guard
+# possibly-empty arrays as ${a[@]+"${a[@]}"} (3.2 treats empty arrays as unset).
+TILDE="~"   # bash 3.2 keeps the backslash in ${p/#$HOME/$TILDE}
+
+DATA_DIR="${DISKWATCH_DATA:-$HOME/.local/share/diskwatch}"
+DB="$DATA_DIR/duc.db"
+SNAP_DIR="$DATA_DIR/snapshots"
+APPS_DB="$DATA_DIR/apps.tsv"          # bundle \t samples \t first_seen \t last_seen
+FREE_LOG="$DATA_DIR/free.tsv"         # epoch \t free_bytes
+LOG="$DATA_DIR/diskwatch.log"
+PROGRESS="$DATA_DIR/progress.log"     # duc -p output of the running scan
+LAST_TOTAL="$DATA_DIR/last_total"     # bytes indexed by the previous scan (progress denominator)
+CLOUD_DB="$DATA_DIR/cloud.db"         # separate index of cloud-drive folders (diskwatch cloud)
+CLOUD_PROGRESS="$DATA_DIR/cloud-progress.log"
+SNAP_LEVELS="${DISKWATCH_LEVELS:-4}"  # folder depth kept in snapshots
+MIN_DELTA_MB="${DISKWATCH_MIN_DELTA_MB:-200}"
+FREE_ALERT_GB="${DISKWATCH_FREE_ALERT_GB:-20}"
+GROWTH_ALERT_GB="${DISKWATCH_GROWTH_ALERT_GB:-5}"
+SAMPLE_SECS=900
+LABEL=com.diskwatch
+# User-settable schedule (diskwatch schedule), read by `diskwatch tick`, which the app's
+# background agent runs every 5 minutes. Kept outside the signed app bundle.
+SCHEDULE_CONF="$DATA_DIR/schedule.conf"
+LAST_SCAN_START="$DATA_DIR/last_scan_start"
+LAST_SAMPLE="$DATA_DIR/last_sample"
+INSTALL_BIN="$HOME/.local/bin/diskwatch"
+# Scheduled scans run through Diskwatch.app (macos-app/build-app.sh) so macOS privacy
+# permissions (Full Disk Access) apply to that app, not to every background bash.
+APP_LAUNCHER="${DISKWATCH_APP:-$HOME/Applications/Diskwatch.app}/Contents/MacOS/diskwatch-launcher"
+
+# Paths to index. Default: the whole data volume (everything under /) plus every local volume mounted
+# in /Volumes. Network shares (smbfs, nfs, ...) are never device-backed so never listed,
+# and `duc index -x` keeps each root on its own filesystem (skips mounts inside it).
+DATA_ROOT=/System/Volumes/Data
+local_volumes() {
+  mount | sed -nE 's#^/dev/[^ ]+ on (/Volumes/.*) \((apfs|hfs|exfat|msdos|ntfs)[,)].*#\1#p' | grep -vx '/Volumes/Recovery'
+}
+if [[ -n ${DISKWATCH_PATHS:-} ]]; then IFS=: read -ra SCAN_PATHS <<<"$DISKWATCH_PATHS"   # colon-separated override
+else SCAN_PATHS=("$DATA_ROOT"); while IFS= read -r v; do SCAN_PATHS+=("$v"); done < <(local_volumes); fi
+
+# Directory names skipped while indexing (duc matches the name, not the path).
+# Cloud-drive folders hold placeholders whose reported size is the cloud copy's, not
+# local disk use, and listing them goes through the provider: millions of entries, hours.
+#   CloudStorage      ~/Library/CloudStorage (Google Drive, OneDrive, Dropbox, iCloudDrive-*)
+#   Mobile Documents  ~/Library/Mobile Documents (iCloud Drive)
+#   Volumes           breaks a firmlink loop: /System/Volumes/Data/System is the real /System,
+#                     whose Volumes/Data leads back to the start (Data → System → Volumes →
+#                     Data …). The system and data volumes share one st_dev, so -x cannot stop
+#                     it. Mounts under any "Volumes" folder (/Volumes/*, ~/Volumes NAS mounts,
+#                     simulator volumes) are separate roots or skipped anyway.
+# Add more with DISKWATCH_EXCLUDE="name1:name2".
+EXCLUDES=(CloudStorage "Mobile Documents" Volumes)
+[[ -n ${DISKWATCH_EXCLUDE:-} ]] && IFS=: read -ra _extra <<<"$DISKWATCH_EXCLUDE" && EXCLUDES+=("${_extra[@]}")
+
+# The data volume is indexed under its real path; show it as / (so ~/x stays ~/x).
+disp_path() { local p=${1#"$DATA_ROOT"}; echo "${p:-/}"; }
+# Map a path the person typed (/, ~/x, /Applications) to where it lives in the index.
+db_path() {
+  local p; p=$(cd "$1" 2>/dev/null && pwd -P || echo "$1")
+  case $p in
+    /Volumes/*|"$DATA_ROOT"*) echo "$p" ;;
+    /) echo "$DATA_ROOT" ;;
+    *) echo "$DATA_ROOT$p" ;;
+  esac
+}
+APP_DIRS=(/Applications "$HOME/Applications")
+
+mkdir -p "$DATA_DIR" "$SNAP_DIR"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+die() { echo "diskwatch: $*" >&2; exit 1; }
+human() { awk -v b="$1" 'BEGIN{s="BKMGTP";a=b<0?-b:b;i=1;while(a>=1024&&i<6){a/=1024;i++}printf "%s%.1f%s",(b<0?"-":""),a,substr(s,i,1)}'; }
+notify() { osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true; }
+free_bytes() { df -k /System/Volumes/Data | awk 'NR==2{print $4*1024}'; }
+take() { awk -v n="$1" 'NR<=n'; }   # like head -n, but reads all input (no SIGPIPE under pipefail)
+need_duc() { command -v duc >/dev/null || die "duc not installed: brew install duc"; }
+need_db() {
+  need_duc
+  [[ -s $DB ]] && return 0
+  if compgen -G "$DB.tmp.*" >/dev/null; then
+    die "first scan still running (started $(stat -f '%SB' -t '%H:%M' "$DB".tmp.* | head -1)); try again when it finishes"
+  fi
+  die "no index yet — run: diskwatch scan"
+}
+
+# ---------------------------------------------------------------- disk
+
+# shellcheck disable=SC2120  # also invoked via the "cmd_$c" "$@" dispatcher
+cmd_scan() {
+  need_duc
+  local paths=() p tmp start ex=() e
+  for e in "${EXCLUDES[@]}"; do ex+=(-e "$e"); done
+  for p in "${SCAN_PATHS[@]}"; do [[ -d $p ]] && paths+=("$p"); done
+  tmp="$DB.tmp.$$"
+  start=$(date +%s)
+  log "scan start: ${paths[*]}"
+  local prev_start; prev_start=$(cat "$LAST_SCAN_START" 2>/dev/null || true)
+  date +%s >"$LAST_SCAN_START"
+  # Index into a temp DB, then swap: the existing cache stays usable during a scan.
+  # taskpolicy -b = background QoS (throttled CPU + disk I/O); nice for good measure.
+  # `script` gives duc a pseudo-terminal so it emits -p progress, captured for `diskwatch progress`.
+  if ! script -q "$PROGRESS" taskpolicy -b nice -n 19 duc index -q -p -H -x ${ex[@]+"${ex[@]}"} -d "$tmp" "${paths[@]}" "$@" </dev/null >/dev/null; then
+    log "duc index exited non-zero (usually permission errors; index still written)"
+  fi
+  if [[ ! -s $tmp ]]; then
+    rm -f "$tmp"
+    if [[ -n $prev_start ]]; then echo "$prev_start" >"$LAST_SCAN_START"; else rm -f "$LAST_SCAN_START"; fi
+    die "index failed"
+  fi
+  mv -f "$tmp" "$DB"
+
+  local snap
+  snap="$SNAP_DIR/$(date +%Y-%m-%dT%H%M).tsv"
+  local d
+  for p in "${paths[@]}"; do
+    d=$(disp_path "$p")
+    duc ls -q -d "$DB" -D -b "$p" | awk -v d="$d" '{print $1"\t"d}'
+    duc ls -q -d "$DB" -b -R --full-path --dirs-only -l "$SNAP_LEVELS" "$p" |
+      awk -v d="$d" '{s=$1; sub(/^[ \t]*[0-9]+[ \t]+/,""); print s"\t"(d=="/" ? "" : d)"/"$0}'
+  done >"$snap"
+  for p in "${paths[@]}"; do awk -F'\t' -v p="$(disp_path "$p")" '$2==p{print $1}' "$snap"; done |
+    awk '{t+=$1} END{print t+0}' >"$LAST_TOTAL"
+  rm -f "$PROGRESS"
+  printf '%s\t%s\n' "$(date +%s)" "$(free_bytes)" >>"$FREE_LOG"
+  ls -1t "$SNAP_DIR"/*.tsv | tail -n +91 | xargs rm -f   # keep last 90 snapshots
+  log "scan done in $(( $(date +%s) - start ))s -> $(basename "$snap")"
+  check_alerts
+}
+
+latest_snaps() { { ls -1t "$SNAP_DIR"/*.tsv 2>/dev/null || true; } | head -n "${1:-2}"; }
+
+# Print "delta \t now \t path" for paths that changed, biggest growth first.
+diff_snaps() {
+  awk -F'\t' -v min=$(( MIN_DELTA_MB * 1024 * 1024 )) '
+    FNR==NR {old[$2]=$1; next}
+    { d=$1-old[$2]; if (d>=min || d<=-min) printf "%d\t%d\t%s\n", d, $1, $2 }
+  ' "$1" "$2" | sort -t$'\t' -k1,1nr
+}
+
+cmd_report() {
+  local n=${1:-20} snaps new old
+  snaps=$(latest_snaps 2)
+  new=$(sed -n 1p <<<"$snaps"); old=$(sed -n 2p <<<"$snaps")
+  [[ -n $new ]] || die "no snapshots yet — run: diskwatch scan"
+  echo "Free space: $(human "$(free_bytes)")"
+  if [[ -z $old ]]; then
+    echo "Only one snapshot ($(basename "$new" .tsv)); largest folders:"
+    sort -t$'\t' -k1,1nr "$new" | take "$n" |
+      while IFS=$'\t' read -r s p; do printf '  %8s  %s\n' "$(human "$s")" "$p"; done
+    return
+  fi
+  echo "Changes since $(basename "$old" .tsv) → $(basename "$new" .tsv) (≥ ${MIN_DELTA_MB}MB):"
+  diff_snaps "$old" "$new" | take "$n" |
+    while IFS=$'\t' read -r d s p; do printf '  %9s  now %8s  %s\n' "$( (( d > 0 )) && echo +)$(human "$d")" "$(human "$s")" "$p"; done
+}
+
+# Size of one path across all snapshots; without PATH, free space at each scan.
+cmd_history() {
+  local f s t free
+  if [[ $# -eq 0 ]]; then
+    [[ -s $FREE_LOG ]] || die "no scans yet"
+    while IFS=$'\t' read -r t free; do
+      printf '%s  free %s\n' "$(date -r "$t" '+%F %H:%M')" "$(human "$free")"
+    done <"$FREE_LOG"
+    return
+  fi
+  for f in "$SNAP_DIR"/*.tsv; do   # names are timestamps, so glob order = time order
+    [[ -e $f ]] || continue
+    s=$(awk -F'\t' -v p="${1%/}" '$2==p{print $1; exit}' "$f")
+    printf '%s  %s\n' "$(basename "$f" .tsv)" "$( [[ -n $s ]] && human "$s" || echo '-')"
+  done
+}
+
+check_alerts() {
+  local free snaps msg
+  free=$(free_bytes)
+  if (( free < FREE_ALERT_GB * 1024 * 1024 * 1024 )); then
+    notify "Disk almost full" "Only $(human "$free") free. Run: diskwatch report"
+  fi
+  snaps=$(latest_snaps 2)
+  [[ $(wc -l <<<"$snaps") -eq 2 ]] || return 0
+  msg=$(diff_snaps "$(sed -n 2p <<<"$snaps")" "$(sed -n 1p <<<"$snaps")" |
+        awk -F'\t' -v t=$(( GROWTH_ALERT_GB * 1024 * 1024 * 1024 )) '$1>=t && !f{print $3; f=1}')
+  [[ -z $msg ]] || notify "Big disk growth" "$msg grew ≥ ${GROWTH_ALERT_GB}GB since last scan"
+}
+
+bar() { # pct width
+  awk -v p="$1" -v w="${2:-40}" 'BEGIN{if(p>100)p=100; n=int(p*w/100); s=""; for(i=0;i<w;i++) s=s (i<n?"█":"░"); printf "%s %5.1f%%", s, p}'
+}
+
+# Progress of a running scan. --watch refreshes every 2s.
+cmd_progress() {
+  if [[ ${1:-} == --watch ]]; then
+    while :; do clear; cmd_progress; sleep 2; done
+  fi
+  if ! pgrep -qf '^duc index .*diskwatch'; then
+    echo "diskwatch scan: not running (last: $(latest_snaps 1 | xargs -n1 basename 2>/dev/null || echo never))"
+    return 0
+  fi
+  local line done_b files total est="" start
+  # Last *complete* progress line; the final one is often still half-written.
+  line=$(tail -c 4096 "$PROGRESS" 2>/dev/null | tr '\r' '\n' |
+         grep -E 'Indexed [0-9.]+[KMGTP]?b in [0-9.]+[KMG]? files' | tail -1 || true)
+  done_b=$(sed -nE 's/.*Indexed ([0-9.]+)([KMGTP]?)b.*/\1 \2/p' <<<"$line" |
+    awk '{m=index("KMGTP",$2); v=$1; while(m-->0) v*=1024; printf "%d", v}')
+  files=$(sed -nE 's/.*in ([0-9.]+[KMG]?) files.*/\1/p' <<<"$line")
+  if [[ -s $LAST_TOTAL ]]; then total=$(<"$LAST_TOTAL")
+  else # first scan: used space of every root being scanned
+    total=$(for r in "${SCAN_PATHS[@]}"; do df -k "$r" 2>/dev/null | awk 'NR==2{print $3*1024}'; done | awk '{t+=$1} END{print t+0}')
+    est="≈"
+  fi
+  start=$(stat -f %B "$PROGRESS" 2>/dev/null || date +%s)
+  printf 'Disk scan  %s  %s / %s%s  %s files  %dm%02ds\n' \
+    "$(bar "$(awk -v a="${done_b:-0}" -v b="$total" 'BEGIN{p=(b>0 ? a*100/b : 0); print (p>99.9 ? 99.9 : p)}')")" \
+    "$(human "${done_b:-0}")" "$est" "$(human "$total")" "${files:-0}" \
+    $(( ($(date +%s) - start) / 60 )) $(( ($(date +%s) - start) % 60 ))
+  [[ -n $est ]] && echo "           (first scan: total estimated from used space; capped at 99.9% until the scan really ends)"
+  return 0
+}
+
+# Browse the cached index. Default: the whole local disk (/). Other roots: `diskwatch ui
+# /Volumes/<disk>`. duc shows one root at a time; `diskwatch roots` lists them.
+# duc-ui = duc built with vim keys (build-duc-ui.sh); falls back to plain duc.
+# Keys: j/k move, h/l parent/enter, g/G top/bottom, ctrl-d/u ctrl-f/b paging,
+#       a apparent, c count, v graph, n name sort, o reveal in Finder, ? help, q quit.
+cmd_ui()  {
+  need_db
+  local ui=duc; command -v duc-ui >/dev/null && ui=duc-ui
+  [[ $# -eq 0 ]] && print_roots >&2
+  [[ $ui == duc-ui ]] && echo "keys: j/k move · h/l up/into · g/G top/bottom · o reveal in Finder · ? help · q quit" >&2
+  exec "$ui" ui -d "$DB" "$(db_path "${1:-/}")"
+}
+cmd_gui() {
+  need_db
+  local g=duc; [[ -x /opt/homebrew/bin/duc ]] && g=/opt/homebrew/bin/duc   # bundled duc has no GUI
+  exec "$g" gui -d "$DB" "$(db_path "${1:-/}")"
+}
+print_roots() {
+  echo "Indexed roots (open one with: diskwatch ui <path>):"
+  duc info -q -d "$DB" | awk 'NR>1{print "  "$NF"  ("$(NF-1)")"}' | sed "s#$DATA_ROOT  #/  (whole local disk)  #"
+}
+cmd_roots() { need_db; print_roots; }
+
+# Size of each PATH from the index (no disk walk). Missing/unindexed paths print "-".
+cmd_du() {
+  need_db
+  local p s
+  for p in "$@"; do
+    s=$(duc ls -q -D -b -d "$DB" "$(db_path "$p")" 2>/dev/null | awk '{print $1; exit}' || true)
+    printf '%9s  %s\n' "$( [[ -n $s ]] && human "$s" || echo -)" "${p/#"$HOME"/$TILDE}"
+  done
+}
+
+# Non-interactive drill-down for scripts and agents: largest children of PATH.
+#   diskwatch ls [PATH] [N]   PATH defaults to /, N (rows) to 20. -a: apparent sizes.
+cmd_ls() {
+  need_db
+  local apparent=() p
+  [[ ${1:-} == -a ]] && { apparent=(-a); shift; }
+  p=$(db_path "${1:-/}")
+  echo "$(disp_path "$p")  (index of $(stat -f '%Sm' -t '%F %H:%M' "$DB"))"
+  duc ls -q ${apparent[@]+"${apparent[@]}"} -b -d "$DB" "$p" | take "${2:-20}" |
+    while read -r s name; do printf '  %9s  %s\n' "$(human "$s")" "$name"; done
+}
+
+# ---------------------------------------------------------------- cloud
+
+cloud_dirs() {
+  local d
+  for d in "$HOME/Library/CloudStorage"/* "$HOME/Library/Mobile Documents"; do
+    [[ -d $d ]] && printf '%s\n' "$d"
+  done
+}
+
+# Cloud drives keep cloud-only files as placeholders: their reported size is the cloud
+# copy's, while only downloaded files use local disk. Indexed separately from the main
+# scan (it can take hours: listing goes through each provider), into its own database.
+#   diskwatch cloud scan    index the cloud folders (background priority)
+#   diskwatch cloud         per folder: local disk used vs size in the cloud
+cmd_cloud() {
+  need_duc
+  case ${1:-show} in
+    scan)
+      local dirs=() tmp d
+      while IFS= read -r d; do dirs+=("$d"); done < <(cloud_dirs)
+      (( ${#dirs[@]} )) || die "no cloud-drive folders found"
+      tmp="$CLOUD_DB.tmp.$$"
+      log "cloud scan start: ${#dirs[@]} folders"
+      script -q "$CLOUD_PROGRESS" taskpolicy -b nice -n 19 duc index -q -p -x -d "$tmp" "${dirs[@]}" </dev/null >/dev/null || true
+      [[ -s $tmp ]] || { rm -f "$tmp"; die "cloud index failed"; }
+      mv -f "$tmp" "$CLOUD_DB"; rm -f "$CLOUD_PROGRESS"
+      log "cloud scan done"
+      cmd_cloud show
+      ;;
+    progress)
+      pgrep -qf '^duc index .*cloud\.db' || { echo "cloud scan: not running"; return 0; }
+      local line
+      line=$(tail -c 4096 "$CLOUD_PROGRESS" 2>/dev/null | tr '\r' '\n' |
+             grep -E 'Indexed [0-9.]+[KMGTP]?b in [0-9.]+[KMG]? files' | tail -1 || true)
+      echo "Cloud scan  ${line#*Indexed }"
+      ;;
+    show)
+      [[ -s $CLOUD_DB ]] || { echo "No cloud index yet — run: diskwatch cloud scan (can take a long time)"; return 0; }
+      echo "Indexed $(stat -f '%Sm' -t '%F %H:%M' "$CLOUD_DB")"
+      printf '%10s  %10s  %s\n' "ON DISK" "IN CLOUD" "FOLDER"
+      local d act app note
+      while IFS= read -r d; do
+        act=$(duc ls -q -d "$CLOUD_DB" -D -b "$d" 2>/dev/null | awk '{print $1; exit}')
+        app=$(duc ls -q -a -d "$CLOUD_DB" -D -b "$d" 2>/dev/null | awk '{print $1; exit}')
+        note=""
+        # macOS renames a provider's folder "Name (DD-MM-YYYY HH:MM)" when it is left
+        # behind (account removed/re-added); the live one keeps the plain name.
+        [[ $d =~ \ \([0-9]{2}-[0-9]{2}-[0-9]{4}\ [0-9]{2}:[0-9]{2}\)$ ]] && note="  ← old copy left behind?"
+        if [[ -z $act ]]; then
+          printf '%10s  %10s  %s\n' "-" "-" "${d/#"$HOME"/$TILDE}  (not in index; rescan)"
+        else
+          printf '%10s  %10s  %s%s\n' "$(human "$act")" "$(human "$app")" "${d/#"$HOME"/$TILDE}" "$note"
+        fi
+      done < <(cloud_dirs)
+      echo
+      echo "ON DISK: space downloaded files use locally. IN CLOUD: total size of the files listed."
+      ;;
+    *) die "usage: diskwatch cloud [scan|show|progress]" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- apps
+
+# Record which .app bundles are running right now (cheap; runs every 15 min).
+cmd_sample() {
+  local now; now=$(date +%s)
+  touch "$APPS_DB"
+  ps -axo comm= | sed -nE 's#^(/.*\.app)/Contents/.*#\1#p' | sort -u |
+    awk -F'\t' -v now="$now" -v OFS='\t' '
+      FNR==NR {seen[$1]=1; next}
+      { if ($1 in seen) { $2++; $4=now; delete seen[$1] } print }
+      END { for (b in seen) print b, 1, now, now }
+    ' - "$APPS_DB" >"$APPS_DB.tmp"
+  mv -f "$APPS_DB.tmp" "$APPS_DB"
+  date +%s >"$LAST_SAMPLE"
+}
+
+app_size() {
+  local s=""
+  [[ -s $DB ]] && s=$(duc ls -q -d "$DB" -D -b "$(db_path "$1")" 2>/dev/null | awk '{print $1; exit}')
+  [[ -n $s ]] || s=$(( $(du -sk "$1" 2>/dev/null | cut -f1) * 1024 ))
+  echo "$s"
+}
+
+# List apps, least recently used first, with size and usage evidence.
+#   diskwatch apps [--days N]   only show apps unused for at least N days
+cmd_apps() {
+  local min_days=0 now since="" app spot cnt obs_n obs_last last days size flag
+  [[ ${1:-} == --days ]] && min_days=${2:?}
+  now=$(date +%s)
+  [[ -s $APPS_DB ]] && since=$(awk -F'\t' 'NR==1||$3<m{m=$3} END{print m}' "$APPS_DB")
+  {
+    for d in "${APP_DIRS[@]}"; do [[ -d $d ]] && find "$d" -maxdepth 2 -name '*.app' -prune -print0; done |
+    while IFS= read -r -d '' app; do
+      spot=$(mdls -raw -nullMarker "" -name kMDItemLastUsedDate "$app" 2>/dev/null)
+      cnt=$(mdls -raw -nullMarker "" -name kMDItemUseCount "$app" 2>/dev/null)
+      last=0
+      [[ -n $spot ]] && last=$(date -j -f '%Y-%m-%d %H:%M:%S %z' "$spot" +%s 2>/dev/null || echo 0)
+      read -r obs_n obs_last < <(awk -F'\t' -v b="$app" '$1==b{print $2, $4; f=1} END{if(!f) print 0, 0}' "$APPS_DB" 2>/dev/null || echo "0 0")
+      (( obs_last > last )) && last=$obs_last
+      if (( last > 0 )); then days=$(( (now - last) / 86400 )); else days=99999; fi
+      (( days >= min_days )) || continue
+      size=$(app_size "$app")
+      printf '%d\t%d\t%s\t%s\t%s\n' "$days" "$size" "${cnt:-0}" "$obs_n" "$app"
+    done
+  } | sort -t$'\t' -k1,1nr -k2,2nr | {
+    local tracked_days=0
+    [[ -n $since ]] && tracked_days=$(( (now - since) / 86400 ))
+    printf '%-9s %8s %8s %8s  %s\n' "LAST USED" SIZE LAUNCHES "SEEN(h)" APP
+    while IFS=$'\t' read -r days size cnt obs_n app; do
+      flag=""
+      # With no record at all, only trust "unused" once we have sampled for 30+ days.
+      if (( size >= 500*1024*1024 )); then
+        if (( days == 99999 )); then (( tracked_days >= 30 )) && flag="  ← candidate"
+        elif (( days >= 90 )); then flag="  ← candidate"; fi
+      fi
+      printf '%-9s %8s %8s %8s  %s%s\n' \
+        "$( (( days == 99999 )) && echo 'no data' || echo "${days}d ago")" \
+        "$(human "$size")" "$cnt" "$(awk -v n="$obs_n" -v s=$SAMPLE_SECS 'BEGIN{printf "%.1f", n*s/3600}')" \
+        "${app/#"$HOME"/$TILDE}" "$flag"
+    done
+  }
+  echo
+  echo "LAST USED: newest of Spotlight's last-launch date and diskwatch's own sampling."
+  echo "'no data' = no Spotlight launch record and not yet seen running; such apps are"
+  echo "only flagged as candidates after 30 days of sampling. Helpers launched by other"
+  echo "apps may look unused — check before deleting."
+  [[ -n $since ]] && echo "Run-time sampling active since $(date -r "$since" '+%F')." \
+                  || echo "Run-time sampling not started yet — run: diskwatch install"
+}
+
+# ---------------------------------------------------------------- schedule
+
+# schedule.conf:  scan=daily 03:00 | weekly sun 03:00 | off      sample=<minutes> (0 = off)
+load_schedule() {
+  SCAN_SCHEDULE="daily 03:00"; SAMPLE_MINUTES=15
+  [[ -f $SCHEDULE_CONF ]] || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    case $k in
+      scan) SCAN_SCHEDULE=$v ;;
+      sample) [[ $v =~ ^[0-9]+$ ]] && SAMPLE_MINUTES=$v ;;
+    esac
+  done <"$SCHEDULE_CONF"
+}
+save_schedule() {
+  mkdir -p "$DATA_DIR"
+  printf 'scan=%s\nsample=%s\n' "$SCAN_SCHEDULE" "$SAMPLE_MINUTES" >"$SCHEDULE_CONF"
+}
+valid_hm() { [[ $1 =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+day_index() { # sun..sat -> 0..6
+  case $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | cut -c1-3) in
+    sun) echo 0 ;; mon) echo 1 ;; tue) echo 2 ;; wed) echo 3 ;; thu) echo 4 ;; fri) echo 5 ;; sat) echo 6 ;; *) return 1 ;;
+  esac
+}
+at_days_ago() { # N HH:MM -> epoch of that wall-clock time N days ago (DST-safe)
+  date -j -v-"$1"d -f '%Y-%m-%d %H:%M:%S' "$(date +%F) $2:00" +%s
+}
+# Epoch of the most recent scheduled scan time <= now (nothing when off).
+last_occurrence() {
+  local kind hm day now occ diff target
+  read -r kind day hm <<<"$SCAN_SCHEDULE"
+  now=$(date +%s)
+  case $kind in
+    daily)
+      hm=$day; occ=$(at_days_ago 0 "$hm"); (( occ > now )) && occ=$(at_days_ago 1 "$hm") ;;
+    weekly)
+      target=$(day_index "$day") || return 0
+      diff=$(( ($(date +%w) - target + 7) % 7 ))
+      occ=$(at_days_ago "$diff" "$hm"); (( occ > now )) && occ=$(at_days_ago $((diff + 7)) "$hm") ;;
+    *) return 0 ;;
+  esac
+  echo "$occ"
+}
+next_occurrence() { # after the most recent one
+  local occ kind; occ=$(last_occurrence); [[ -n $occ ]] || return 0
+  read -r kind _ <<<"$SCAN_SCHEDULE"
+  date -j -v+"$([[ $kind == weekly ]] && echo 7 || echo 1)"d -f %s "$occ" +%s
+}
+agent_status() {
+  [[ -x $APP_LAUNCHER ]] || { echo "no app (legacy launchd jobs)"; return; }
+  local st; st=$("$APP_LAUNCHER" --agent-status 2>/dev/null | head -1)
+  case $st in
+    enabled|requires-approval|not-registered|not-found) echo "$st" ;;
+    *) echo "unknown (rebuild Diskwatch.app: macos-app/build-app.sh)" ;;
+  esac
+}
+
+#   diskwatch schedule                         show
+#   diskwatch schedule scan daily HH:MM        every day
+#   diskwatch schedule scan weekly DAY HH:MM   once a week (sun..sat)
+#   diskwatch schedule scan off
+#   diskwatch schedule sample MINUTES|off      app-usage sampling interval
+# shellcheck disable=SC2120  # also invoked via the "cmd_$c" "$@" dispatcher
+cmd_schedule() {
+  load_schedule
+  case ${1:-} in
+    "")
+      local next; next=$(next_occurrence)
+      echo "Scan:    $SCAN_SCHEDULE$( [[ -n $next ]] && echo "   (next: $(date -r "$next" '+%a %F %H:%M'), catches up after sleep)")"
+      echo "Sample:  $( (( SAMPLE_MINUTES > 0 )) && echo "every $SAMPLE_MINUTES min" || echo off)"
+      echo "Agent:   $(agent_status)   (checks the schedule every 5 min)"
+      [[ -s $LAST_SCAN_START ]] && echo "Last scan started: $(date -r "$(cat "$LAST_SCAN_START")" '+%a %F %H:%M')"
+      return 0 ;;
+    scan)
+      case ${2:-} in
+        off) SCAN_SCHEDULE=off ;;
+        daily) valid_hm "${3:-}" || die "usage: diskwatch schedule scan daily HH:MM"; SCAN_SCHEDULE="daily $3" ;;
+        weekly)
+          day_index "${3:-}" >/dev/null && valid_hm "${4:-}" || die "usage: diskwatch schedule scan weekly sun|mon|…|sat HH:MM"
+          SCAN_SCHEDULE="weekly $(printf '%s' "$3" | tr '[:upper:]' '[:lower:]' | cut -c1-3) $4" ;;
+        *) die "usage: diskwatch schedule scan daily HH:MM | weekly DAY HH:MM | off" ;;
+      esac ;;
+    sample)
+      case ${2:-} in
+        off|0) SAMPLE_MINUTES=0 ;;
+        *) [[ ${2:-} =~ ^[0-9]+$ ]] && (( $2 >= 5 && $2 <= 1440 )) || die "usage: diskwatch schedule sample MINUTES (5-1440) | off"
+           SAMPLE_MINUTES=$2 ;;
+      esac ;;
+    *) die "usage: diskwatch schedule [scan daily HH:MM | scan weekly DAY HH:MM | scan off | sample MINUTES|off]" ;;
+  esac
+  save_schedule
+  cmd_schedule
+}
+
+# Run whatever the schedule says is due; the background agent calls this every 5 min.
+cmd_tick() {
+  load_schedule
+  local now last occ; now=$(date +%s)
+  if (( SAMPLE_MINUTES > 0 )); then
+    last=$(cat "$LAST_SAMPLE" 2>/dev/null || echo 0)
+    (( now - last >= SAMPLE_MINUTES * 60 - 30 )) && cmd_sample
+  fi
+  occ=$(last_occurrence)
+  [[ -n $occ ]] || return 0
+  # An index made before the scheduler existed counts as the last scan.
+  [[ -s $LAST_SCAN_START || ! -s $DB ]] || stat -f %m "$DB" >"$LAST_SCAN_START"
+  last=$(cat "$LAST_SCAN_START" 2>/dev/null || echo 0)
+  if (( last < occ )) && ! pgrep -qf '^duc index .*diskwatch'; then
+    log "tick: scheduled scan due ($SCAN_SCHEDULE)"
+    cmd_scan
+  fi
+  return 0
+}
+
+# Full Disk Access probe. Run it as the app (`open -a Diskwatch --args fda-check`) so macOS
+# attributes it to Diskwatch.app; ~/Library/Mail is readable only with Full Disk Access and
+# fails without a prompt otherwise. Result: $DATA_DIR/fda-check (and stdout).
+cmd_fda-check() {
+  local r=denied; ls "$HOME/Library/Mail" >/dev/null 2>&1 && r=granted
+  mkdir -p "$DATA_DIR"; printf '%s %s %s\n' "$(date '+%F %T')" "$r" "${DISKWATCH_APP:-cli}" >"$DATA_DIR/fda-check"
+  echo "Full Disk Access: $r"
+}
+
+# ---------------------------------------------------------------- launchd
+
+plist() { # label interval|calendar args...
+  local label=$1 kind=$2; shift 2
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array><string>$( [[ -x $APP_LAUNCHER ]] && echo "$APP_LAUNCHER" || echo "$INSTALL_BIN")</string><string>$1</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>StandardErrorPath</key><string>$LOG</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>19</integer>
+$( [[ $kind == interval ]] && echo "  <key>StartInterval</key><integer>$SAMPLE_SECS</integer><key>RunAtLoad</key><true/>" \
+                           || echo "  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>${2:-3}</integer><key>Minute</key><integer>0</integer></dict>")
+</dict></plist>
+EOF
+}
+
+cmd_install() {
+  local la="$HOME/Library/LaunchAgents" uid j; uid=$(id -u)
+  mkdir -p "$(dirname "$INSTALL_BIN")" "$la" "$DATA_DIR"
+  [[ $# -gt 0 ]] && { load_schedule; SCAN_SCHEDULE="daily $(printf '%02d' "$1"):00"; save_schedule; }
+  if [[ -n ${DISKWATCH_APP:-} ]]; then
+    # Self-contained app: the CLI is a wrapper around the app's launcher.
+    printf '#!/bin/sh\n# Generated by Diskwatch.app (diskwatch install)\nexec "%s" "$@"\n' "$APP_LAUNCHER" >"$INSTALL_BIN"
+    chmod 755 "$INSTALL_BIN"
+    # Older installs had one launchd job per task; the app's agent replaces both.
+    for j in scan sample; do
+      launchctl bootout "gui/$uid/$LABEL.$j" 2>/dev/null || true
+      rm -f "$la/$LABEL.$j.plist"
+    done
+    echo "Agent: $("$APP_LAUNCHER" --register)"
+    echo "Installed $INSTALL_BIN → $DISKWATCH_APP"
+    cmd_schedule
+    return
+  fi
+  # Without the app (plain script): one launchd job per task.
+  local hour; hour=$(load_schedule; read -r _ hm <<<"$SCAN_SCHEDULE"; echo "${hm%%:*}"); hour=${hour#0}
+  [[ -f "$(dirname "$0")/$(basename "$0")" ]] && [[ $(cd "$(dirname "$0")" && pwd)/$(basename "$0") == "$INSTALL_BIN" ]] || install -m 755 "$0" "$INSTALL_BIN"
+  plist "$LABEL.scan" calendar scan "${hour:-3}" >"$la/$LABEL.scan.plist"
+  plist "$LABEL.sample" interval sample >"$la/$LABEL.sample.plist"
+  for j in scan sample; do
+    launchctl bootout "gui/$uid/$LABEL.$j" 2>/dev/null || true
+    launchctl bootstrap "gui/$uid" "$la/$LABEL.$j.plist"
+  done
+  echo "Installed $INSTALL_BIN (legacy launchd jobs: daily scan at ${hour:-3}:00, sampling every $((SAMPLE_SECS / 60)) min)"
+}
+
+cmd_uninstall() {
+  local uid j; uid=$(id -u)
+  [[ -x $APP_LAUNCHER ]] && echo "Agent: $("$APP_LAUNCHER" --unregister)"
+  for j in scan sample; do
+    launchctl bootout "gui/$uid/$LABEL.$j" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/$LABEL.$j.plist"
+  done
+  rm -f "$INSTALL_BIN"
+  echo "Removed background jobs and $INSTALL_BIN. Data and schedule kept in $DATA_DIR."
+}
+
+cmd_status() {
+  echo "Data:      $DATA_DIR ($(du -sh "$DATA_DIR" | cut -f1))"
+  echo "Free:      $(human "$(free_bytes)")"
+  echo "Snapshots: $(ls "$SNAP_DIR"/*.tsv 2>/dev/null | wc -l | tr -d ' ') (latest: $(latest_snaps 1 | xargs -n1 basename 2>/dev/null || echo none))"
+  echo "Apps seen: $(wc -l <"$APPS_DB" 2>/dev/null | tr -d ' ' || echo 0)"
+  echo "Agent:     $(agent_status)"
+  load_schedule; echo "Schedule:  scan $SCAN_SCHEDULE; sample $( (( SAMPLE_MINUTES > 0 )) && echo "every $SAMPLE_MINUTES min" || echo off)"
+  echo "Last log:"; tail -n 3 "$LOG" 2>/dev/null | sed 's/^/  /'
+}
+
+usage() {
+  cat <<EOF
+diskwatch — track what is eating your disk, and which apps you never use.
+
+  scan              index disk (background priority) and save a snapshot
+  report [N]        what grew/shrank since the previous scan (top N, default 20)
+  history [PATH]    size of PATH in every snapshot
+  progress [--watch] progress bar of a running scan
+  ui [PATH]         browse the cached index with vim keys (default /; also /Volumes/<disk>)
+  gui [PATH]        graphical sunburst of the cached index
+  ls [-a] [PATH] [N] largest children of PATH from the index (non-interactive)
+  du PATH...        size of each PATH from the index (instant, no disk walk)
+  roots             list indexed roots (data volume + local volumes)
+  cloud [scan]      cloud drives: local disk used vs cloud size (scan: index them, slow)
+  apps [--days N]   apps by last use, size, launches; flags large unused apps
+  sample            record running apps (scheduled; see schedule)
+  schedule [...]    show/set: scan daily HH:MM | scan weekly DAY HH:MM | scan off | sample MIN|off
+  tick              run what the schedule says is due (the background agent, every 5 min)
+  install [HOUR]    register the background agent (optional: daily scan at HOUR)
+  uninstall         remove the background agent and CLI wrapper
+  status            show data location, last scan, agents
+
+Tuning via env: DISKWATCH_MIN_DELTA_MB, DISKWATCH_FREE_ALERT_GB,
+DISKWATCH_GROWTH_ALERT_GB, DISKWATCH_LEVELS, DISKWATCH_DATA.
+EOF
+}
+
+case "${1:-help}" in
+  scan|report|history|progress|ui|gui|roots|ls|du|cloud|apps|sample|schedule|tick|fda-check|install|uninstall|status) c=$1; shift; "cmd_$c" "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

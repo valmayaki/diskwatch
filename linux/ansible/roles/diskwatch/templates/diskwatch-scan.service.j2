@@ -1,0 +1,9 @@
+# {{ ansible_managed }}
+[Unit]
+Description=diskwatch: index disk usage
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/diskwatch
+ExecStart={{ diskwatch_bin }} scan
+Nice=19
+IOSchedulingClass=idle

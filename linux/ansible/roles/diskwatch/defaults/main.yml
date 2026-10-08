@@ -1,0 +1,11 @@
+---
+diskwatch_state: present            # present | absent (absent keeps /var/lib/diskwatch)
+diskwatch_scan_hour: 3              # nightly scan hour (randomized within 15 min)
+diskwatch_first_scan: false         # start an index right away when none exists
+diskwatch_free_alert_pct: 10        # alert when a filesystem has less free space than this
+diskwatch_growth_alert_gb: 5        # alert when a folder grows this much between scans
+diskwatch_exclude: ""               # colon-separated directory names to skip
+diskwatch_notify_cmd: ""            # receives alert text on stdin, e.g. "curl -s -d @- ntfy.sh/topic"
+diskwatch_data_dir: /var/lib/diskwatch
+diskwatch_bin: /usr/local/bin/diskwatch
+diskwatch_duc_ui_bin: /usr/local/bin/duc-ui

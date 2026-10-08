@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+[Unit]
+Description=diskwatch: sample running packages
+[Service]
+Type=oneshot
+ExecStart={{ diskwatch_bin }} sample
+Nice=19

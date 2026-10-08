@@ -1,0 +1,6 @@
+.DS_Store
+/dist/
+/macos/app/build/
+/linux/ansible/roles/diskwatch/files/duc-ui-*
+/linux/ansible/inventory.yml
+*.tmp

@@ -1,0 +1,22 @@
+---
+# Prebuilt per Debian release as files/duc-ui-<release> (linux/build-duc-ui.sh).
+- name: Find the duc-ui build for {{ ansible_distribution_release }}
+  ansible.builtin.set_fact:
+    diskwatch_duc_ui_src: "{{ lookup('ansible.builtin.fileglob', role_path + '/files/duc-ui-' + ansible_distribution_release) }}"
+  tags: [diskwatch, diskwatch_ui]
+
+- name: Install duc-ui
+  ansible.builtin.copy:
+    src: "{{ diskwatch_duc_ui_src }}"
+    dest: "{{ diskwatch_duc_ui_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: diskwatch_duc_ui_src | length > 0
+  tags: [diskwatch, diskwatch_ui]
+
+- name: Report missing duc-ui build (diskwatch ui falls back to duc ui)
+  ansible.builtin.debug:
+    msg: "No duc-ui build for {{ ansible_distribution_release }}; run linux/build-duc-ui.sh"
+  when: diskwatch_duc_ui_src | length == 0
+  tags: [diskwatch, diskwatch_ui]

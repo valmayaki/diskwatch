@@ -1,0 +1,24 @@
+---
+- name: Stop and disable diskwatch timers
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop: [diskwatch-scan.timer, diskwatch-sample.timer]
+  failed_when: false
+  tags: [diskwatch, diskwatch_remove]
+
+- name: Remove diskwatch files (the data directory is kept)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/diskwatch-scan.service
+    - /etc/systemd/system/diskwatch-scan.timer
+    - /etc/systemd/system/diskwatch-sample.service
+    - /etc/systemd/system/diskwatch-sample.timer
+    - "{{ diskwatch_bin }}"
+    - "{{ diskwatch_duc_ui_bin }}"
+    - /etc/default/diskwatch
+  notify: Reload systemd
+  tags: [diskwatch, diskwatch_remove]

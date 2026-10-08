@@ -1,0 +1,14 @@
+---
+# Install diskwatch on Debian / Proxmox hosts.
+#   ansible-playbook -i inventory.yml playbook-diskwatch.yml
+#   ansible-playbook -i inventory.yml playbook-diskwatch.yml --check --diff     preview
+#   ansible-playbook -i inventory.yml playbook-diskwatch.yml -e target_hosts=host-a
+#   ansible-playbook -i inventory.yml playbook-diskwatch.yml -e diskwatch_first_scan=true
+#   ansible-playbook -i inventory.yml playbook-diskwatch.yml -t diskwatch_script  only the script
+#   ansible-playbook -i inventory.yml playbook-diskwatch.yml -e diskwatch_state=absent
+- name: Install diskwatch
+  hosts: "{{ target_hosts | default('diskwatch_hosts') }}"
+  become: true
+  roles:
+    - role: diskwatch
+      tags: [diskwatch]

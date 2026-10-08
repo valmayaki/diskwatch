@@ -1,0 +1,44 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning macos/diskwatch linux/diskwatch linux/build-duc-ui.sh \
+            macos/app/build-app.sh macos/app/build-duc.sh macos/app/create-signing-cert.sh \
+            skill/diskwatch/scripts/overview.sh
+      - name: duc patch applies to duc 1.4.4, 1.4.5, 1.4.6
+        run: |
+          for v in 1.4.4 1.4.5 1.4.6; do
+            curl -fsSL "https://github.com/zevv/duc/releases/download/$v/duc-$v.tar.gz" \
+              | tar xzO "duc-$v/src/duc/cmd-ui.c" > "/tmp/cmd-ui-$v.c"
+            python3 common/duc_vim_patch.py "/tmp/cmd-ui-$v.c"
+            grep -q "case 'i'" "/tmp/cmd-ui-$v.c"
+          done
+      - name: ansible-lint
+        run: |
+          pipx install ansible-lint >/dev/null
+          cd linux/ansible && ansible-lint playbook-diskwatch.yml roles/diskwatch
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash 3.2 syntax
+        run: /bin/bash -n macos/diskwatch
+      - name: Swift launcher type-checks for macOS 12
+        run: |
+          swiftc -typecheck -target arm64-apple-macos12.0 macos/app/launcher.swift
+          swiftc -typecheck -target x86_64-apple-macos12.0 macos/app/launcher.swift
+      - name: build standalone duc (universal, macOS 12)
+        run: |
+          macos/app/build-duc.sh
+          lipo -archs macos/app/build/duc | grep -q x86_64
+          otool -l macos/app/build/duc | grep -A2 LC_BUILD_VERSION | grep -q 'minos 12.0'
