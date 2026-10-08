@@ -40,5 +40,8 @@ jobs:
       - name: build standalone duc (universal, macOS 12)
         run: |
           macos/app/build-duc.sh
-          lipo -archs macos/app/build/duc | grep -q x86_64
-          otool -l macos/app/build/duc | grep -A2 LC_BUILD_VERSION | grep -q 'minos 12.0'
+          for arch in arm64 x86_64; do
+            minos=$(otool -arch "$arch" -l macos/app/build/duc | awk '/minos/{v=$2} END{print v}')
+            echo "$arch minos=$minos"; [ "$minos" = 12.0 ]
+          done
+          ! otool -L macos/app/build/duc | grep -v '^/' | grep -vE '^\s+/usr/lib/' | grep -q .   # system libraries only
