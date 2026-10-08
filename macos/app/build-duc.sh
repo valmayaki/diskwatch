@@ -48,10 +48,11 @@ for arch in "${archs[@]}"; do
      TC_CFLAGS="-I$pfx/include" TC_LIBS="-L$pfx/lib -ltokyocabinet -lz -lbz2 -lm" \
      PKG_CONFIG=/usr/bin/false >/dev/null \
    && make -s -j"$(sysctl -n hw.ncpu)" 2>&1 | grep -iE '\berror\b' || true)
-  cp "$work/duc-$arch/duc" "$work/duc.$arch"
+  cp "$work/duc-$arch/duc" "$work/bin-duc.$arch"
 done
 
-lipo -create -output "$out/duc" "$work"/duc.*
+bins=(); for arch in "${archs[@]}"; do bins+=("$work/bin-duc.$arch"); done
+lipo -create -output "$out/duc" "${bins[@]}"
 chmod 755 "$out/duc"
 echo "built $out/duc: $(lipo -archs "$out/duc"), minimum macOS $(otool -l "$out/duc" | awk '/minos/{print $2; exit}')"
 otool -L "$out/duc" | tail -n +2
