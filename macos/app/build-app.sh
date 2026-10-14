@@ -2,7 +2,8 @@
 # Build ~/Applications/Diskwatch.app: self-contained, universal (arm64 + x86_64), macOS 12+.
 #   Contents/MacOS/diskwatch-launcher                  Swift launcher (child-process runner,
 #                                                       --register/--unregister/--agent-status)
-#   Contents/Library/LaunchAgents/com.diskwatch.agent.plist   background agent (SMAppService, 13+)
+#   Contents/Library/LaunchAgents/com.diskwatch.agent.plist   SMAppService agent, only with
+#                                                       DISKWATCH_SMAPPSERVICE=1 (Team-ID builds)
 #   Contents/Resources/diskwatch, bin/duc, Diskwatch.icns
 # Rebuilding changes the ad-hoc signature: re-add the app under Full Disk Access.
 set -euo pipefail
@@ -22,10 +23,16 @@ done
 lipo -create -output "$here/build/diskwatch-launcher" "$here/build/launcher.arm64" "$here/build/launcher.x86_64"
 
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/bin" "$app/Contents/Library/LaunchAgents"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/bin"
 cp "$here/Info.plist" "$app/Contents/Info.plist"
 cp "$here/Diskwatch.icns" "$app/Contents/Resources/Diskwatch.icns"
-cp "$here/com.diskwatch.agent.plist" "$app/Contents/Library/LaunchAgents/"
+# The bundled SMAppService agent is opt-in: for a locally signed or ad-hoc app, Background Task
+# Management keeps re-submitting a stale record of it at every login (see launcher.swift), so
+# such builds ship without it and use the LaunchAgent file (com.diskwatch.tick).
+if [[ ${DISKWATCH_SMAPPSERVICE:-0} == 1 ]]; then
+  mkdir -p "$app/Contents/Library/LaunchAgents"
+  cp "$here/com.diskwatch.agent.plist" "$app/Contents/Library/LaunchAgents/"
+fi
 install -m 755 "$here/../diskwatch" "$app/Contents/Resources/diskwatch"
 install -m 755 "$here/build/duc" "$app/Contents/Resources/bin/duc"
 ln -s duc "$app/Contents/Resources/bin/duc-ui"
@@ -50,9 +57,8 @@ done
 # Refresh Launch Services so Finder shows the icon.
 touch "$app"
 (( installed_build )) && /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app"
-# Re-register the agent for the new build (also repairs one launchd can no longer start).
-# Locally signed builds use a LaunchAgent file; Team-ID builds use SMAppService, verify the
-# first run and fall back to the LaunchAgent file if launchd rejects it.
+# Re-register the agent for the new build (also repairs one launchd can no longer start, and
+# migrates a pre-1.1.1 LaunchAgent file to the com.diskwatch.tick label).
 L="$app/Contents/MacOS/diskwatch-launcher"
 if (( installed_build )) && [[ $("$L" --agent-status 2>/dev/null) =~ ^(enabled|broken|requires-approval)$ ]]; then
   "$L" --unregister >/dev/null; sleep 5
