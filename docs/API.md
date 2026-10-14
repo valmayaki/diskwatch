@@ -73,6 +73,7 @@ Reports work for any user; `scan`, `sample`, `install`, `uninstall` need root.
 diskwatch schedule                           # show: scan schedule, next run, sampling, agent
 diskwatch schedule scan daily HH:MM          # e.g. daily 03:00
 diskwatch schedule scan weekly DAY HH:MM     # DAY: sun mon tue wed thu fri sat
+diskwatch schedule scan every N              # every N hours from midnight; N: 1 2 3 4 6 8 12
 diskwatch schedule scan off
 diskwatch schedule sample MINUTES            # app sampling interval, 5–1440
 diskwatch schedule sample off
@@ -127,7 +128,7 @@ Unix seconds.
 | File | Platform | Format |
 |---|---|---|
 | `duc.db` | both | duc index (Tokyo Cabinet). Read it with `duc ls -d duc.db PATH`, `duc info -d duc.db`. Replaced atomically after each scan. |
-| `snapshots/YYYY-MM-DDTHHMM.tsv` | both | `bytes	path` for every root and folder down to `DISKWATCH_LEVELS`. Last 90 kept. |
+| `snapshots/YYYY-MM-DDTHHMM.tsv` | both | `bytes	path` for every root and folder down to `DISKWATCH_LEVELS`. All from today and the 2 days before, then the newest per day; at most 90. |
 | `free.tsv` | both | `epoch	free_bytes` per scan |
 | `last_total` | both | Bytes indexed by the last scan (progress denominator) |
 | `progress.log` | both | Raw `duc index -p` output of the running scan (removed when done) |

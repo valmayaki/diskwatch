@@ -75,7 +75,7 @@ diskwatch ls ~/Library 15        # largest items in a folder (from the index)
 diskwatch du ~/.cache /opt       # size of specific paths
 diskwatch history ~/Library      # one folder across every snapshot
 diskwatch ui                     # browse interactively (vim keys, i = info, ? = help)
-diskwatch schedule scan daily 03:00     # macOS: when scans run
+diskwatch schedule scan daily 03:00     # macOS: when scans run (or: scan every 3)
 diskwatch apps --days 90         # macOS: large apps unused for 90+ days
 sudo diskwatch storage           # Linux: thin pools, ZFS, Proxmox guest disks
 sudo diskwatch cleanup           # Linux: what can be reclaimed, and how
