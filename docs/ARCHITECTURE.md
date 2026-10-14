@@ -42,7 +42,7 @@ reports for apps, packages, cloud drives and block storage.
 ```
 Diskwatch.app/Contents/
   MacOS/diskwatch-launcher                       Swift launcher (universal, macOS 12+)
-  Library/LaunchAgents/com.diskwatch.agent.plist  bundled agent (SMAppService, macOS 13+)
+  Library/LaunchAgents/com.diskwatch.agent.plist  SMAppService agent (only DISKWATCH_SMAPPSERVICE=1 builds)
   Resources/diskwatch                            the bash program (bash 3.2 compatible)
   Resources/bin/duc, duc-ui                      duc 1.4.6 + patch, static Tokyo Cabinet
   Resources/Diskwatch.icns
@@ -68,8 +68,8 @@ The launcher starts the bundled script with `posix_spawn` and waits for it.
 
 ### Scheduling
 
-One fixed agent, `com.diskwatch.agent`, runs `diskwatch tick` every 5 minutes (and at
-load). `tick` reads `schedule.conf`, runs the app sample when its interval has passed, and
+One fixed agent runs `diskwatch tick` every 5 minutes (and at load): `com.diskwatch.tick`
+(LaunchAgent file), or `com.diskwatch.agent` for SMAppService builds. `tick` reads `schedule.conf`, runs the app sample when its interval has passed, and
 runs a scan when the last scan started before the most recent scheduled time. This keeps
 the agent definition constant: a user-settable schedule lives outside the signed bundle, and
 missed runs (sleep, shutdown) catch up within 5 minutes. launchd does not start a second
@@ -77,18 +77,22 @@ instance while a scan is still running.
 
 Registration:
 
-- **macOS 13+, app signed with a Team ID** (Developer ID) uses
-  `SMAppService.agent(plistName:)` with the plist inside the bundle; the agent shows in Login
-  Items and goes away with the app. Background Task Management pins a launch constraint
-  (LWCR) to the code hashes of the build that was registered. The launcher verifies the
-  first run and falls back to the LaunchAgent file if launchd rejects it.
-- **Locally signed or ad-hoc builds** never use SMAppService. For such an app the constraint
-  can pass at registration and fail after a reboot: launchd then logs "Could not find and/or
-  execute program specified by service", the job shows `spawn failed` / exit 78 `EX_CONFIG`,
-  and nothing runs, with no error anywhere a user would see it. `--agent-status` reports
-  that state as `broken`; `diskwatch install` (or `build-app.sh`) re-registers.
-- **macOS 12** (and the fallback) writes `~/Library/LaunchAgents/com.diskwatch.agent.plist`
-  with the absolute launcher path and loads it with `launchctl bootstrap`.
+- **Default (locally signed or ad-hoc builds, and macOS 12):** a LaunchAgent file
+  `~/Library/LaunchAgents/com.diskwatch.tick.plist` with the absolute launcher path, loaded
+  with `launchctl bootstrap`. These builds do not ship the bundled agent.
+- **SMAppService (opt-in):** only for builds made with `DISKWATCH_SMAPPSERVICE=1` *and*
+  signed with a Team ID (Developer ID). Uses `SMAppService.agent(plistName:)` with the
+  bundled plist (label `com.diskwatch.agent`); the agent shows in Login Items and goes away
+  with the app. The launcher verifies the first run and falls back to the LaunchAgent file.
+- **Why two labels:** Background Task Management keeps a record of an SMAppService agent once
+  registered, and `unregister()` from a rebuilt app does not remove it. At every login it
+  re-submits that record. For a locally signed app launchd cannot start it ("Could not find
+  and/or execute program specified by service", `spawn failed`, exit 78 `EX_CONFIG`). Up to
+  1.1.0 the LaunchAgent file used the same label, so the stale record replaced it after each
+  reboot and nothing ran. With its own label the file can't be overridden. A leftover
+  `com.diskwatch.agent` record is harmless. `--agent-status` reports a job that cannot start
+  as `broken`; `diskwatch install` (or `build-app.sh`) re-registers and migrates a pre-1.1.1
+  `com.diskwatch.agent.plist` file.
 
 ### Privacy permissions (TCC)
 

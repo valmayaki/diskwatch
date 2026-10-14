@@ -155,5 +155,5 @@ ARCHES="amd64 arm64" linux/build-duc-ui.sh
 
 Include: platform and version (`sw_vers` / `cat /etc/os-release`), how diskwatch is
 installed (app, script, Ansible), the command and its output, and for macOS scheduling
-issues `diskwatch status` and `launchctl print gui/$UID/com.diskwatch.agent | head -40`.
+issues `diskwatch status` and `launchctl print gui/$UID/com.diskwatch.tick | head -40`.
 Remove paths or host names you don't want public.

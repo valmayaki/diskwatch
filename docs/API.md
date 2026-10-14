@@ -155,7 +155,7 @@ for f in $(ls -1 | tail -2); do awk -F'\t' -v p="$HOME/Library" '$2==p{print FIL
 | Invocation | Result |
 |---|---|
 | `diskwatch-launcher <command> [args]` | Runs the bundled script with `<command>` as a child process (same process group, so terminal UIs and Ctrl-C work). Exit status is the script's. |
-| `diskwatch-launcher --register` | Registers the background agent `com.diskwatch.agent` (`tick` every 5 min). macOS 13+ with a Team-ID signature: SMAppService, then verifies the first run and falls back to `~/Library/LaunchAgents/com.diskwatch.agent.plist` if launchd rejects it. Locally signed or ad-hoc builds, and macOS 12: the LaunchAgent file. Also repairs a `broken` agent. Prints `enabled`, `requires-approval`, or `enabled (LaunchAgent …)`. |
+| `diskwatch-launcher --register` | Registers the background agent (`tick` every 5 min). Default: LaunchAgent file `~/Library/LaunchAgents/com.diskwatch.tick.plist`. Builds with the bundled agent (`DISKWATCH_SMAPPSERVICE=1`) and a Team-ID signature on macOS 13+: SMAppService (`com.diskwatch.agent`), verifying the first run and falling back to the LaunchAgent file. Also repairs a `broken` agent and migrates a pre-1.1.1 `com.diskwatch.agent.plist` file. Prints `enabled`, `requires-approval`, or `enabled (LaunchAgent …)`. |
 | `diskwatch-launcher --unregister` | Removes the agent (both mechanisms). Prints `not-registered`. |
 | `diskwatch-launcher --agent-status` | Prints exactly one of `enabled`, `broken` (registered, but launchd cannot start it: spawn failed / exit 78), `requires-approval`, `not-registered`, `not-found`. |
 

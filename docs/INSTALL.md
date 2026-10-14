@@ -174,7 +174,7 @@ See [SKILLS.md](SKILLS.md).
 | Symptom | Cause and fix |
 |---|---|
 | Scheduled scan never finishes; macOS prompt "would like to access Documents" | Full Disk Access missing or for an older build. Re-add the app; check with `fda-check`. |
-| Agent never runs; `launchctl print gui/$UID/com.diskwatch.agent` shows exit 78 or `OS_REASON_CODESIGNING` | The app was rebuilt after registration. Run `diskwatch-launcher install` (it re-registers and falls back to a LaunchAgent file if launchd rejects the bundled agent). |
+| `diskwatch status` shows `Agent: broken`, or the agent stops after a reboot | launchd cannot start the job (`launchctl print gui/$UID/com.diskwatch.tick`: spawn failed / exit 78). Run `diskwatch install`; it re-registers under `com.diskwatch.tick`. Up to 1.1.0 a stale SMAppService record replaced the agent after every reboot; 1.1.1 avoids that with a separate label. |
 | "Diskwatch can't be opened" | Gatekeeper quarantine on an unsigned download: `xattr -dr com.apple.quarantine ~/Applications/Diskwatch.app`. |
 | `diskwatch report` totals larger than the disk | APFS clones are counted per copy; see [ARCHITECTURE.md](ARCHITECTURE.md#accounting-pitfalls). |
 | Index total smaller than `df` used | Root-only folders, snapshots, swap and purgeable space are not indexed; normal. |

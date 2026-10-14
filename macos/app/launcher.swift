@@ -3,24 +3,29 @@
 //   diskwatch-launcher <args...>      run the bundled diskwatch script as a CHILD and wait.
 //                                      macOS privacy (TCC) attributes a child's file access
 //                                      to the app that spawned it; never exec() bash here.
-//   diskwatch-launcher --register      enable the background agent (com.diskwatch.agent)
+//   diskwatch-launcher --register      enable the background agent
 //   diskwatch-launcher --unregister    disable it
 //   diskwatch-launcher --agent-status  print: enabled | broken | requires-approval | not-registered
 //
 // The agent is one fixed job that runs `diskwatch tick` every 5 minutes; the user's
 // schedule lives outside the bundle (diskwatch schedule), so the signed app never changes.
-// macOS 13+, app signed with a Team ID (Developer ID): registered from inside the bundle with
-//            SMAppService (shown in Login Items).
-// Otherwise (macOS 12, or a locally signed / ad-hoc build): written to ~/Library/LaunchAgents
-//            and loaded with launchctl. SMAppService pins a launch constraint (LWCR) to the
-//            build's code hashes; for a locally signed app launchd can reject that constraint
-//            after a reboot ("spawn failed", exit 78) and the agent silently stops running.
+//
+// Two mechanisms, with DIFFERENT labels:
+// - com.diskwatch.tick   LaunchAgent file in ~/Library/LaunchAgents (absolute program path).
+//                        Used for locally signed and ad-hoc builds, and on macOS 12.
+// - com.diskwatch.agent  SMAppService agent bundled at Contents/Library/LaunchAgents. Only in
+//                        builds made with DISKWATCH_SMAPPSERVICE=1 and signed with a Team ID.
+// Background Task Management keeps a record of a once-registered SMAppService agent and
+// re-submits it at every login, even after unregister() from a rebuilt app. For a locally
+// signed app launchd cannot start it ("spawn failed", exit 78). Sharing that label let the
+// stale record override the LaunchAgent file after each reboot, so the file uses its own label.
 import Foundation
 import Security
 import ServiceManagement
 
-let agentLabel = "com.diskwatch.agent"
+let agentLabel = "com.diskwatch.agent"          // bundled SMAppService agent
 let agentPlistName = "\(agentLabel).plist"
+let fileLabel = "com.diskwatch.tick"            // LaunchAgent file
 let fm = FileManager.default
 
 let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
@@ -32,8 +37,11 @@ let bundleURL: URL = {
 }()
 let contents = bundleURL.appendingPathComponent("Contents")
 let launcherPath = contents.appendingPathComponent("MacOS/diskwatch-launcher").path
-let legacyPlist = fm.homeDirectoryForCurrentUser
-    .appendingPathComponent("Library/LaunchAgents/\(agentPlistName)")
+let bundledAgentPlist = contents.appendingPathComponent("Library/LaunchAgents/\(agentPlistName)")
+let userAgents = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
+let legacyPlist = userAgents.appendingPathComponent("\(fileLabel).plist")
+// Written by 1.0.1-1.1.0 under the shared label; migrated away on --register.
+let oldLegacyPlist = userAgents.appendingPathComponent(agentPlistName)
 
 func eprint(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
@@ -58,23 +66,38 @@ func capture(_ path: String, _ args: [String]) -> String {
     return String(decoding: data, as: UTF8.self)
 }
 
-// Wait for the agent's first run after registration: true once it runs or exits 0,
+let uidDomain = "gui/\(getuid())"
+// Test hook: DISKWATCH_FORCE_LEGACY=1 exercises the macOS 12 code path on newer systems.
+let forceLegacy = ProcessInfo.processInfo.environment["DISKWATCH_FORCE_LEGACY"] == "1"
+
+// Wait for a job's first run after registration: true once it runs or exits 0,
 // false if launchd rejects it (EX_CONFIG 78 / OS_REASON_CODESIGNING).
-func firstRunOK(timeout: Int = 15) -> Bool {
+func firstRunOK(_ label: String, timeout: Int = 15) -> Bool {
     for _ in 0..<timeout {
         sleep(1)
-        let st = capture("/bin/launchctl", ["print", "\(uidDomain)/\(agentLabel)"])
+        let st = capture("/bin/launchctl", ["print", "\(uidDomain)/\(label)"])
         if st.contains("state = running") || st.contains("last exit code = 0") { return true }
         if st.contains("last exit code = 78") || st.contains("OS_REASON_CODESIGNING") { return false }
     }
     return false
 }
 
-// ---- macOS 12 fallback: plain LaunchAgent file (same job, absolute program path)
+func isLoaded(_ label: String) -> Bool {
+    run("/bin/launchctl", ["print", "\(uidDomain)/\(label)"]) == 0
+}
+
+// A loaded job that launchd cannot start: registration looks fine, but nothing ever runs.
+func spawnFails(_ label: String) -> Bool {
+    let st = capture("/bin/launchctl", ["print", "\(uidDomain)/\(label)"])
+    return st.contains("job state = spawn failed") || st.contains("last exit code = 78")
+        || st.contains("OS_REASON_CODESIGNING")
+}
+
+// ---- LaunchAgent file (com.diskwatch.tick): absolute program path, no launch constraint
 
 func legacyPlistData() throws -> Data {
     let plist: [String: Any] = [
-        "Label": agentLabel,
+        "Label": fileLabel,
         "ProgramArguments": [launcherPath, "tick"],
         "StartInterval": 300,
         "RunAtLoad": true,
@@ -86,37 +109,35 @@ func legacyPlistData() throws -> Data {
     return try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
 }
 
-let uidDomain = "gui/\(getuid())"
-// Test hook: DISKWATCH_FORCE_LEGACY=1 exercises the macOS 12 code path on newer systems.
-let forceLegacy = ProcessInfo.processInfo.environment["DISKWATCH_FORCE_LEGACY"] == "1"
+// Remove the pre-1.1.1 LaunchAgent file that used the shared label.
+func dropOldLegacyFile() {
+    guard fm.fileExists(atPath: oldLegacyPlist.path) else { return }
+    run("/bin/launchctl", ["bootout", uidDomain, oldLegacyPlist.path])
+    try? fm.removeItem(at: oldLegacyPlist)
+}
 
 func legacyRegister() -> Int32 {
+    dropOldLegacyFile()
     do {
-        try fm.createDirectory(at: legacyPlist.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: userAgents, withIntermediateDirectories: true)
         try legacyPlistData().write(to: legacyPlist)
     } catch { eprint("Diskwatch: cannot write \(legacyPlist.path): \(error)"); return 1 }
-    run("/bin/launchctl", ["bootout", "\(uidDomain)/\(agentLabel)"])
+    run("/bin/launchctl", ["bootout", "\(uidDomain)/\(fileLabel)"])
     let rc = run("/bin/launchctl", ["bootstrap", uidDomain, legacyPlist.path])
     print(rc == 0 ? "enabled (LaunchAgent \(legacyPlist.path))" : "launchctl bootstrap failed (\(rc))")
     return rc == 0 ? 0 : 1
 }
 
 func legacyUnregister() -> Int32 {
-    run("/bin/launchctl", ["bootout", "\(uidDomain)/\(agentLabel)"])
+    run("/bin/launchctl", ["bootout", "\(uidDomain)/\(fileLabel)"])
     try? fm.removeItem(at: legacyPlist)
+    dropOldLegacyFile()
     print("not-registered")
     return 0
 }
 
 func legacyStatus() -> String {
-    run("/bin/launchctl", ["print", "\(uidDomain)/\(agentLabel)"]) == 0 ? "enabled" : "not-registered"
-}
-
-// A loaded job that launchd cannot start: registration looks fine, but nothing ever runs.
-func agentSpawnFails() -> Bool {
-    let st = capture("/bin/launchctl", ["print", "\(uidDomain)/\(agentLabel)"])
-    return st.contains("job state = spawn failed") || st.contains("last exit code = 78")
-        || st.contains("OS_REASON_CODESIGNING")
+    isLoaded(fileLabel) ? (spawnFails(fileLabel) ? "broken" : "enabled") : "not-registered"
 }
 
 // Team ID of the app's signature; nil for ad-hoc or locally signed builds.
@@ -128,6 +149,13 @@ func signingTeamID() -> String? {
     guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
           let dict = info as? [String: Any] else { return nil }
     return dict[kSecCodeInfoTeamIdentifier as String] as? String
+}
+
+// SMAppService only for builds that ship the bundled agent and carry a Team ID.
+func useSMAppService() -> Bool {
+    if forceLegacy { return false }
+    guard #available(macOS 13.0, *) else { return false }
+    return signingTeamID() != nil && fm.fileExists(atPath: bundledAgentPlist.path)
 }
 
 // ---- macOS 13+: SMAppService agent bundled at Contents/Library/LaunchAgents
@@ -145,8 +173,12 @@ func smStatusText(_ s: SMAppService.Status) -> String {
 
 @available(macOS 13.0, *)
 func smRegister() -> Int32 {
-    // Drop a macOS-12-style copy if one exists, so the job is not loaded twice.
-    if fm.fileExists(atPath: legacyPlist.path) { _ = legacyUnregister() }
+    // Drop LaunchAgent-file copies, so the job is not loaded twice.
+    if fm.fileExists(atPath: legacyPlist.path) || fm.fileExists(atPath: oldLegacyPlist.path) {
+        run("/bin/launchctl", ["bootout", "\(uidDomain)/\(fileLabel)"])
+        try? fm.removeItem(at: legacyPlist)
+        dropOldLegacyFile()
+    }
     let svc = SMAppService.agent(plistName: agentPlistName)
     do { try svc.register() } catch {
         eprint("Diskwatch: SMAppService register failed: \(error.localizedDescription)")
@@ -157,10 +189,8 @@ func smRegister() -> Int32 {
         SMAppService.openSystemSettingsLoginItems()
         return 0
     }
-    // Background Task Management can keep a stale launch constraint for a rebuilt,
-    // locally signed app, and launchd then refuses to start the bundled agent. Verify the
-    // first run; fall back to the LaunchAgent file (same job, no constraint) if rejected.
-    if svc.status == .enabled && firstRunOK() {
+    // Verify the first run; fall back to the LaunchAgent file if launchd rejects the agent.
+    if svc.status == .enabled && firstRunOK(agentLabel) {
         print("enabled")
         return 0
     }
@@ -170,40 +200,37 @@ func smRegister() -> Int32 {
     return legacyRegister()
 }
 
-@available(macOS 13.0, *)
-func smUnregister() -> Int32 {
-    let svc = SMAppService.agent(plistName: agentPlistName)
-    do { try svc.unregister() } catch { /* already unregistered */ }
-    if fm.fileExists(atPath: legacyPlist.path) { _ = legacyUnregister() } else { print("not-registered") }
-    return 0
-}
-
 // ---- main
 
 let args = Array(CommandLine.arguments.dropFirst())
 switch args.first {
 case "--register":
+    if #available(macOS 13.0, *), useSMAppService() { exit(smRegister()) }
     if #available(macOS 13.0, *), !forceLegacy {
-        if signingTeamID() != nil { exit(smRegister()) }
-        // Locally signed: use the LaunchAgent file, and drop any bundled registration
-        // first so the same label is not submitted twice.
+        // Best effort: a stale bundled registration may survive this (see header), but it
+        // can no longer take the LaunchAgent file's label.
         try? SMAppService.agent(plistName: agentPlistName).unregister()
     }
     exit(legacyRegister())
 case "--unregister":
-    if #available(macOS 13.0, *), !forceLegacy { exit(smUnregister()) } else { exit(legacyUnregister()) }
+    if #available(macOS 13.0, *), !forceLegacy {
+        try? SMAppService.agent(plistName: agentPlistName).unregister()
+    }
+    exit(legacyUnregister())
 case "--agent-status":
-    // Report the mechanism actually in use: the LaunchAgent file wins when present
-    // (it is the fallback when launchd rejects the bundled agent).
+    // Report the mechanism actually in use.
     var st: String
     if fm.fileExists(atPath: legacyPlist.path) {
         st = legacyStatus()
-    } else if #available(macOS 13.0, *), !forceLegacy {
+    } else if fm.fileExists(atPath: oldLegacyPlist.path) {
+        // Pre-1.1.1 install: shared label, overridden after reboot. `diskwatch install` migrates.
+        st = isLoaded(agentLabel) && !spawnFails(agentLabel) ? "enabled" : "broken"
+    } else if #available(macOS 13.0, *), useSMAppService() {
         st = smStatusText(SMAppService.agent(plistName: agentPlistName).status)
+        if st == "enabled" && spawnFails(agentLabel) { st = "broken" }
     } else {
-        st = legacyStatus()
+        st = "not-registered"
     }
-    if st == "enabled" && agentSpawnFails() { st = "broken" }
     print(st)
     exit(0)
 default:

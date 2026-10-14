@@ -3,6 +3,21 @@
 All notable changes are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-10-14
+
+### Fixed (macOS)
+- The background agent still stopped after a reboot (1.0.1's fix was incomplete). Background
+  Task Management keeps the record of a once-registered SMAppService agent, re-submits it at
+  every login even after `unregister()`, and launchd cannot start it for a locally signed app.
+  It shared the label `com.diskwatch.agent` with the LaunchAgent file, so it replaced the
+  working job after each reboot. The LaunchAgent file now uses its own label,
+  `com.diskwatch.tick`, which a stale record cannot override.
+- Default builds no longer ship the bundled SMAppService agent
+  (`Contents/Library/LaunchAgents`); it is opt-in with `DISKWATCH_SMAPPSERVICE=1` for
+  Team-ID-signed builds.
+- `diskwatch install` / `build-app.sh` migrate a pre-1.1.1 `com.diskwatch.agent.plist`
+  LaunchAgent file to the new label.
+
 ## [1.1.0] - 2026-10-14
 
 ### Added (macOS)
@@ -64,6 +79,7 @@ First public release.
   popup (path, type, on-disk/apparent size, file count, live modified time, owner, mode).
 - Agent skill (`skill/diskwatch`) for AI coding assistants.
 
+[1.1.1]: https://github.com/valmayaki/diskwatch/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/valmayaki/diskwatch/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/valmayaki/diskwatch/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/valmayaki/diskwatch/releases/tag/v1.0.0
