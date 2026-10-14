@@ -77,12 +77,16 @@ instance while a scan is still running.
 
 Registration:
 
-- **macOS 13+** uses `SMAppService.agent(plistName:)` with the plist inside the bundle;
-  the agent shows in Login Items and goes away with the app. Background Task Management pins
-  a launch constraint to the build that was registered; for a rebuilt, locally signed app it
-  can keep a stale record, and launchd then refuses to start the job (exit 78 `EX_CONFIG`
-  or `OS_REASON_CODESIGNING`). The launcher therefore verifies the first run and falls back
-  to the LaunchAgent file.
+- **macOS 13+, app signed with a Team ID** (Developer ID) uses
+  `SMAppService.agent(plistName:)` with the plist inside the bundle; the agent shows in Login
+  Items and goes away with the app. Background Task Management pins a launch constraint
+  (LWCR) to the code hashes of the build that was registered. The launcher verifies the
+  first run and falls back to the LaunchAgent file if launchd rejects it.
+- **Locally signed or ad-hoc builds** never use SMAppService. For such an app the constraint
+  can pass at registration and fail after a reboot: launchd then logs "Could not find and/or
+  execute program specified by service", the job shows `spawn failed` / exit 78 `EX_CONFIG`,
+  and nothing runs, with no error anywhere a user would see it. `--agent-status` reports
+  that state as `broken`; `diskwatch install` (or `build-app.sh`) re-registers.
 - **macOS 12** (and the fallback) writes `~/Library/LaunchAgents/com.diskwatch.agent.plist`
   with the absolute launcher path and loads it with `launchctl bootstrap`.
 

@@ -5,13 +5,18 @@
 //                                      to the app that spawned it; never exec() bash here.
 //   diskwatch-launcher --register      enable the background agent (com.diskwatch.agent)
 //   diskwatch-launcher --unregister    disable it
-//   diskwatch-launcher --agent-status  print: enabled | requires-approval | not-registered
+//   diskwatch-launcher --agent-status  print: enabled | broken | requires-approval | not-registered
 //
 // The agent is one fixed job that runs `diskwatch tick` every 5 minutes; the user's
 // schedule lives outside the bundle (diskwatch schedule), so the signed app never changes.
-// macOS 13+: registered from inside the bundle with SMAppService (shown in Login Items).
-// macOS 12:  written to ~/Library/LaunchAgents and loaded with launchctl.
+// macOS 13+, app signed with a Team ID (Developer ID): registered from inside the bundle with
+//            SMAppService (shown in Login Items).
+// Otherwise (macOS 12, or a locally signed / ad-hoc build): written to ~/Library/LaunchAgents
+//            and loaded with launchctl. SMAppService pins a launch constraint (LWCR) to the
+//            build's code hashes; for a locally signed app launchd can reject that constraint
+//            after a reboot ("spawn failed", exit 78) and the agent silently stops running.
 import Foundation
+import Security
 import ServiceManagement
 
 let agentLabel = "com.diskwatch.agent"
@@ -107,6 +112,24 @@ func legacyStatus() -> String {
     run("/bin/launchctl", ["print", "\(uidDomain)/\(agentLabel)"]) == 0 ? "enabled" : "not-registered"
 }
 
+// A loaded job that launchd cannot start: registration looks fine, but nothing ever runs.
+func agentSpawnFails() -> Bool {
+    let st = capture("/bin/launchctl", ["print", "\(uidDomain)/\(agentLabel)"])
+    return st.contains("job state = spawn failed") || st.contains("last exit code = 78")
+        || st.contains("OS_REASON_CODESIGNING")
+}
+
+// Team ID of the app's signature; nil for ad-hoc or locally signed builds.
+func signingTeamID() -> String? {
+    var code: SecStaticCode?
+    guard SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &code) == errSecSuccess,
+          let code = code else { return nil }
+    var info: CFDictionary?
+    guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+          let dict = info as? [String: Any] else { return nil }
+    return dict[kSecCodeInfoTeamIdentifier as String] as? String
+}
+
 // ---- macOS 13+: SMAppService agent bundled at Contents/Library/LaunchAgents
 
 @available(macOS 13.0, *)
@@ -160,19 +183,28 @@ func smUnregister() -> Int32 {
 let args = Array(CommandLine.arguments.dropFirst())
 switch args.first {
 case "--register":
-    if #available(macOS 13.0, *), !forceLegacy { exit(smRegister()) } else { exit(legacyRegister()) }
+    if #available(macOS 13.0, *), !forceLegacy {
+        if signingTeamID() != nil { exit(smRegister()) }
+        // Locally signed: use the LaunchAgent file, and drop any bundled registration
+        // first so the same label is not submitted twice.
+        try? SMAppService.agent(plistName: agentPlistName).unregister()
+    }
+    exit(legacyRegister())
 case "--unregister":
     if #available(macOS 13.0, *), !forceLegacy { exit(smUnregister()) } else { exit(legacyUnregister()) }
 case "--agent-status":
     // Report the mechanism actually in use: the LaunchAgent file wins when present
     // (it is the fallback when launchd rejects the bundled agent).
+    var st: String
     if fm.fileExists(atPath: legacyPlist.path) {
-        print(legacyStatus())
+        st = legacyStatus()
     } else if #available(macOS 13.0, *), !forceLegacy {
-        print(smStatusText(SMAppService.agent(plistName: agentPlistName).status))
+        st = smStatusText(SMAppService.agent(plistName: agentPlistName).status)
     } else {
-        print(legacyStatus())
+        st = legacyStatus()
     }
+    if st == "enabled" && agentSpawnFails() { st = "broken" }
+    print(st)
     exit(0)
 default:
     break
