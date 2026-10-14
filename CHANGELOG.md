@@ -3,7 +3,7 @@
 All notable changes are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.1] - 2026-10-14
 
 ### Fixed (macOS)
 - Background agent silently stopped after a reboot on locally signed builds: launchd
@@ -49,4 +49,5 @@ First public release.
   popup (path, type, on-disk/apparent size, file count, live modified time, owner, mode).
 - Agent skill (`skill/diskwatch`) for AI coding assistants.
 
+[1.0.1]: https://github.com/valmayaki/diskwatch/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/valmayaki/diskwatch/releases/tag/v1.0.0
