@@ -110,9 +110,15 @@ cmd_scan() {
   # Index into a temp DB, then swap: the existing cache stays usable during a scan.
   # taskpolicy -b = background QoS (throttled CPU + disk I/O); nice for good measure.
   # `script` gives duc a pseudo-terminal so it emits -p progress, captured for `diskwatch progress`.
-  if ! script -q "$PROGRESS" taskpolicy -b nice -n 19 duc index -q -p -H -x ${ex[@]+"${ex[@]}"} -d "$tmp" "${paths[@]}" "$@" </dev/null >/dev/null; then
-    log "duc index exited non-zero (usually permission errors; index still written)"
-  fi
+  local rc=0
+  script -q "$PROGRESS" taskpolicy -b nice -n 19 duc index -q -p -H -x ${ex[@]+"${ex[@]}"} -d "$tmp" "${paths[@]}" "$@" </dev/null >/dev/null || rc=$?
+  case $rc in
+    0) ;;
+    2|9|15) # script(1) reports a child killed by SIGINT/SIGKILL/SIGTERM as the signal number
+      log "duc index killed by signal $rc: partial index discarded"
+      rm -f "$tmp" ;;
+    *) log "duc index exited $rc (usually permission errors; index still written)" ;;
+  esac
   if [[ ! -s $tmp ]]; then
     rm -f "$tmp"
     if [[ -n $prev_start ]]; then echo "$prev_start" >"$LAST_SCAN_START"; else rm -f "$LAST_SCAN_START"; fi
@@ -459,6 +465,7 @@ agent_status() {
   local st; st=$("$APP_LAUNCHER" --agent-status 2>/dev/null | head -1)
   case $st in
     enabled|requires-approval|not-registered|not-found) echo "$st" ;;
+    broken) echo "broken: launchd cannot start it, nothing is scheduled (repair: diskwatch install)" ;;
     *) echo "unknown (rebuild Diskwatch.app: macos-app/build-app.sh)" ;;
   esac
 }
@@ -500,9 +507,25 @@ cmd_schedule() {
   cmd_schedule
 }
 
+# A scan killed before it swapped its temp index in (SIGKILL, logout, crash) leaves
+# $DB.tmp.PID behind and has already advanced LAST_SCAN_START, so the scheduler would treat
+# it as done. Drop the partial index and date the last scan from the index in use.
+reap_interrupted_scan() {
+  local t pid
+  for t in "$DB".tmp.*; do
+    [[ -e $t ]] || continue
+    pid=${t##*.}
+    kill -0 "$pid" 2>/dev/null && continue
+    rm -f "$t"
+    log "scan interrupted (pid $pid): removed its partial index; rescanning when due"
+    if [[ -s $DB ]]; then stat -f %m "$DB" >"$LAST_SCAN_START"; else rm -f "$LAST_SCAN_START"; fi
+  done
+}
+
 # Run whatever the schedule says is due; the background agent calls this every 5 min.
 cmd_tick() {
   load_schedule
+  reap_interrupted_scan
   local now last occ; now=$(date +%s)
   if (( SAMPLE_MINUTES > 0 )); then
     last=$(cat "$LAST_SAMPLE" 2>/dev/null || echo 0)

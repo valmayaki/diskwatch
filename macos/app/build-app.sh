@@ -50,10 +50,11 @@ done
 # Refresh Launch Services so Finder shows the icon.
 touch "$app"
 (( installed_build )) && /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app"
-# Re-register the agent for the new build. The launcher verifies the first run and falls
-# back from the bundled SMAppService agent to a LaunchAgent file if launchd rejects it.
+# Re-register the agent for the new build (also repairs one launchd can no longer start).
+# Locally signed builds use a LaunchAgent file; Team-ID builds use SMAppService, verify the
+# first run and fall back to the LaunchAgent file if launchd rejects it.
 L="$app/Contents/MacOS/diskwatch-launcher"
-if (( installed_build )) && [[ $("$L" --agent-status 2>/dev/null) == enabled ]]; then
+if (( installed_build )) && [[ $("$L" --agent-status 2>/dev/null) =~ ^(enabled|broken|requires-approval)$ ]]; then
   "$L" --unregister >/dev/null; sleep 5
   echo "agent: $("$L" --register)"
 fi

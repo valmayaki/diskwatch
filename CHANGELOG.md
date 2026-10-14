@@ -3,6 +3,20 @@
 All notable changes are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed (macOS)
+- Background agent silently stopped after a reboot on locally signed builds: launchd
+  rejected the SMAppService launch constraint ("spawn failed", exit 78) while
+  `status`/`schedule` still reported `enabled`. Locally signed and ad-hoc builds now
+  register a LaunchAgent file (absolute path, no constraint); SMAppService is kept for
+  Team-ID-signed builds. `--agent-status` reports `broken` when launchd cannot start the
+  job, `status`/`schedule` show how to repair it, and `build-app.sh` re-registers it.
+- A scan killed before it swapped its index in (signal, logout, crash) left
+  `duc.db.tmp.PID` behind and counted as done, so no scan ran until the next scheduled
+  day. `tick` now removes the partial index and rescans; a duc killed by SIGINT/SIGKILL/SIGTERM
+  is no longer swapped in as a complete index.
+
 ## [1.0.0] - 2026-10-08
 
 First public release.
