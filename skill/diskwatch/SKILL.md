@@ -34,7 +34,7 @@ background priority. Never walk the disk with `du`/`find` when the index can ans
   `diskwatch scan` in the background and follow it with `diskwatch progress` (one line with
   a percentage; capped at 99.9 % until done). The index is swapped in only on completion.
 - macOS schedule: `diskwatch schedule` (show), `diskwatch schedule scan daily HH:MM |
-  weekly DAY HH:MM | off`, `diskwatch schedule sample MIN|off`. The app's agent runs
+  weekly DAY HH:MM | every N | off` (N hours: 1 2 3 4 6 8 12), `diskwatch schedule sample MIN|off`. The app's agent runs
   `diskwatch tick` every 5 minutes. Linux: systemd timers (`diskwatch status`).
 - If scheduled macOS scans stall, check Full Disk Access as the app:
   `open -a Diskwatch --args fda-check; cat ~/.local/share/diskwatch/fda-check`.

@@ -3,6 +3,21 @@
 All notable changes are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added (macOS)
+- `schedule scan every N`: scan every N hours (1, 2, 3, 4, 6, 8 or 12), with slots counted
+  from local midnight (`every 3` = 00:00, 03:00, 06:00, …); catches up after sleep like the
+  daily and weekly schedules.
+
+### Changed (macOS)
+- Snapshot retention: every snapshot from today and the 2 days before, then the newest one
+  per day, at most 90. Frequent scans no longer shrink the history to a few days.
+
+### Fixed (macOS)
+- `install` without the app (legacy launchd jobs) read the scan hour from the schedule text
+  and produced an invalid hour for `weekly` schedules; it now takes HH from `HH:MM` or uses 3.
+
 ## [1.0.1] - 2026-10-14
 
 ### Fixed (macOS)

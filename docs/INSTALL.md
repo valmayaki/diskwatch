@@ -17,7 +17,7 @@
 | Tools | none beyond macOS (`/bin/bash` 3.2, `launchctl`, `mdls`, `diskutil`, `taskpolicy`, `script`) | Xcode Command Line Tools (`xcode-select --install`): `clang`, `swiftc`, `lipo`, `codesign`; plus `curl`, `python3`, `shasum` |
 | Libraries | macOS system libraries only (`libSystem`, `libz`, `libbz2`, `libncurses`); duc and Tokyo Cabinet are bundled | sources downloaded and checksum-verified by `build-duc.sh` |
 | Optional | Homebrew `duc` for the graphical `diskwatch gui` (`brew install duc`) | `shellcheck` for linting |
-| Disk / memory | app 1.8 MB; index ≈ 90 MB for a 500 GB disk; ≈ 7 MB per daily snapshot (last 90 kept); scans peak ≈ 40 MB RAM | – |
+| Disk / memory | app 1.8 MB; index ≈ 90 MB for a 500 GB disk; ≈ 7 MB per snapshot (recent ones all kept, then one per day; at most 90); scans peak ≈ 40 MB RAM | – |
 
 ### Linux
 
